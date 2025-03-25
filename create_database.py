@@ -63,9 +63,8 @@ def embed_glm2_parallel(sequences_device_id):
     start_time = time.time()
     model, tokenizer = initialize_model_and_tokenizer(device_id)
     
-
     for i in range(len(sequences)):
-        sequences[i] = "<+>" + sequences[i]
+        sequences[i] = "<+>" + sequences[i].rstrip('*')
 
     device = torch.device(f'cuda:{device_id}')
     embeddings_array = np.empty((0, d), dtype=np.float32)
@@ -79,8 +78,8 @@ def embed_glm2_parallel(sequences_device_id):
         encodings = tokenizer(sequences[seq_start:min(seq_start + batch_size, len(sequences))], return_tensors='pt', padding=True, truncation=True, max_length=512)
         
         with torch.no_grad():
-            attention_mask = encodings.attention_mask.bool().cuda() #this is very important to handle the padding correctly
-            pooled_embeds = model(encodings.input_ids.to(device_id), attention_mask=attention_mask).pooler_output
+            attention_mask = encodings.attention_mask.bool().to(device) #this is very important to handle the padding correctly
+            pooled_embeds = model(encodings.input_ids.to(device), attention_mask=attention_mask).pooler_output
 
         embeddings = torch.cat((embeddings, pooled_embeds), dim=0)
 
@@ -182,63 +181,76 @@ def compute_all_embeddings_parallel(input_fasta, output_folder, size_of_chunk=10
 
     return
 
-def create_faiss_database(input_fasta, database_folder, size_of_subdatabases=5000000):
+def process_subdatabase(embedding_file, bytes_per_vector, database_folder, start_index, end_index, subdatabase_id):
+    """
+    Process a subdatabase by reading vectors, training the FAISS index, and saving it.
+    """
+
+    local_vectors = np.empty((0, d), dtype=np.float32)
+    with open(embedding_file, "rb") as ef:
+        ef.seek(start_index * bytes_per_vector)
+        bytes_data = ef.read((end_index - start_index) * bytes_per_vector)
+
+        # Convert the bytes data into vectors
+        num_vectors = len(bytes_data) // bytes_per_vector
+        bytes_read = bytes_data[:num_vectors * bytes_per_vector]
+        local_vectors = np.frombuffer(bytes_read, dtype=np.float16).reshape(-1, d).astype(np.float32)
+
+    #load the trained index 
+    local_index_db = faiss.read_index(os.path.join(database_folder, "faiss_index_empty.bins"))
+
+    #fill the index
+    local_index_db.add(local_vectors)
+
+    # Save the FAISS index for this subdatabase
+    index_file = os.path.join(database_folder, f"faiss_index_{subdatabase_id}.bin")
+    faiss.write_index(local_index_db, index_file)
+    print(f"Subdatabase {subdatabase_id} saved to {index_file}")
+
+def create_faiss_database(input_fasta, database_folder, number_of_threads=1, size_of_subdatabases=5000000):
     
     #choice of the index based on https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index
-    index_db = faiss.index_factory(d, "OPQ64,IVF64k_HNSW,PQ64" )
     total_number_of_vectors = 0
     initial_index_of_subdatabase = 0
 
-    size_of_training_data = 200000
-    if size_of_training_data > size_of_subdatabases:
-        print("ERROR, code 4509")
-        sys.exit(1)
-
-    # print("DEBUG INDEX")
-    # index_db = faiss.index_factory(d, "HNSW,Flat" )
-
     embedding_file = os.path.join(database_folder, f"{os.path.basename(input_fasta)}.embeddings")
     print("Reading from file:", embedding_file)
-    with open(embedding_file, "rb") as ef:
-        bytes_data = ef.read()
-
-    # Cut the bytes data into pieces of two bytes and reshape into vectors of 512 floats
     bytes_per_vector = d * 2  # Each float16 is 2 bytes
-    num_vectors = len(bytes_data) // bytes_per_vector
-    bytes_read = bytes_data[:num_vectors * bytes_per_vector]
-    vector = np.frombuffer(bytes_read, dtype=np.float16).reshape(-1, d).astype(np.float32)
     vectors = np.empty((0, d), dtype=np.float32)
-    vectors = np.vstack((vectors, vector))
 
-    if len(vectors) >= size_of_training_data:
-        if not index_db.is_trained:
-            index_db.train(vectors)
-        total_number_of_vectors += len(vectors)
-        index_db.add(vectors)
-        vectors = np.empty((0, d), dtype=np.float32)
+    # Determine the total number of vectors
+    with open(embedding_file, "rb") as ef:
+        ef.seek(0, os.SEEK_END)
+        total_vectors = ef.tell() // bytes_per_vector
 
-        if total_number_of_vectors-initial_index_of_subdatabase >= size_of_subdatabases:
+    if total_vectors < 50000000 :
+        print("WARNING: indexing using HNSW because less than 5M vectors")
+        index = faiss.index_factory(d, "HNSW,Flat" )
+    else:
+        # Read the first 5M vectors and train the index
+        with open(embedding_file, "rb") as ef:
+            training_data_bytes = ef.read(5000000 * bytes_per_vector)
+            training_data = np.frombuffer(training_data_bytes, dtype=np.float16).reshape(-1, d).astype(np.float32)
 
-            # Save the current FAISS index to a file
-            index_file = os.path.join(database_folder, f"faiss_index_{initial_index_of_subdatabase}.bin")
-            faiss.write_index(index_db, index_file)
-            print(f"Subdatabase {initial_index_of_subdatabase} saved to {index_file}")
+        # Initialize the FAISS index
+        index = faiss.index_factory(d, "OPQ64,IVF64k_HNSW,PQ64")
+        if not index.is_trained:
+            index.train(training_data)
 
-            # Start a new subdatabase, keeping the same index structure
-            initial_index_of_subdatabase = total_number_of_vectors
-            index_db.reset()
-            vectors = np.empty((0, d), dtype=np.float32)
+    # Save the empty FAISS index
+    empty_index_file = os.path.join(database_folder, "faiss_index_empty.bins")
+    faiss.write_index(index, empty_index_file)
+    print(f"Empty FAISS index saved to {empty_index_file}")
 
-    # Add any remaining vectors
-    if len(vectors) > 0:
-        if not index_db.is_trained:
-            index_db.train(vectors)
-        index_db.add(vectors)
+    # Create tasks for each subdatabase
+    tasks = []
+    for subdatabase_id, start_index in enumerate(range(0, total_vectors, size_of_subdatabases)):
+        end_index = min(start_index + size_of_subdatabases, total_vectors)
+        tasks.append((embedding_file, bytes_per_vector, database_folder, start_index, end_index, subdatabase_id))
 
-    # Save the FAISS index
-    index_file = os.path.join(database_folder, f"faiss_index_{initial_index_of_subdatabase}.bin")
-    faiss.write_index(index_db, index_file)
-    print(f"FAISS database created and saved to {index_file}")
+    # Process subdatabases in parallel
+    with Pool(processes=number_of_threads) as pool:
+        pool.starmap(process_subdatabase, tasks)
 
 def query_faiss_database(input_fasta, database_folder, query_sequence, cutoff=0.2, num_gpus=1):
     """
@@ -306,6 +318,7 @@ if __name__ == "__main__":
     parser.add_argument("output_folder", type=str, help="Path to the output folder where embeddings will be saved.")
     parser.add_argument("--chunk_size", type=int, default=1000000, help="Number of sequences per chunk (default: 100000).")
     parser.add_argument("--num_gpus", type=int, default=0, help="Number of GPUs to use (default: all available).")
+    parser.add_argument("--num_cpus", type=int, default=1, help="Number of GPUs to use (default: 1).")
     parser.add_argument("-F", "--force", action="store_true", help="Force overwrite of the output folder if it exists.")
 
     args = parser.parse_args()
@@ -332,8 +345,8 @@ if __name__ == "__main__":
         num_gpus=args.num_gpus
     )
 
-    create_faiss_database(args.input_fasta, database_folder=args.output_folder, size_of_subdatabases=5000000)
+    create_faiss_database(args.input_fasta, database_folder=args.output_folder, size_of_subdatabases=10000000)
 
-    query_results = query_faiss_database(args.input_fasta, database_folder=args.output_folder, query_sequence = "MPPHAARPGPAQNRRGCAMAVMTPRRERSSLLSRALQVTAAAATALVTAVSLAAPAHAANPYERGPNPTDALLEARSGPFSVSEENVSRLGASGFGGGTIYYPRENNTYGAVAISPGYTGTQASVAWLGKRIASHGFVVITIDTITTLDQPDSRARQLNAALDYMINDASSAVRSRIDSSRLAVMGHSMGGGGSLRLASQRPDLKAAIPLTPWHLNKNWSSVRVPTLIIGADLDTIAPVLTHARPFYNSLPTSISKAYLELDGATHFAPNIPNKIIGKYSVAWLKRFVDNDTRYTQFLCPGPRDGLFGEVEEYRSTCPF")
+    query_results = query_faiss_database(args.input_fasta, number_of_threads=args.num_cpus, database_folder=args.output_folder, query_sequence = "MPPHAARPGPAQNRRGCAMAVMTPRRERSSLLSRALQVTAAAATALVTAVSLAAPAHAANPYERGPNPTDALLEARSGPFSVSEENVSRLGASGFGGGTIYYPRENNTYGAVAISPGYTGTQASVAWLGKRIASHGFVVITIDTITTLDQPDSRARQLNAALDYMINDASSAVRSRIDSSRLAVMGHSMGGGGSLRLASQRPDLKAAIPLTPWHLNKNWSSVRVPTLIIGADLDTIAPVLTHARPFYNSLPTSISKAYLELDGATHFAPNIPNKIIGKYSVAWLKRFVDNDTRYTQFLCPGPRDGLFGEVEEYRSTCPF")
     print(query_results)
 
