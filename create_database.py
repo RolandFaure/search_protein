@@ -338,15 +338,20 @@ if __name__ == "__main__":
         shutil.rmtree(args.output_folder)  
     os.makedirs(args.output_folder)
 
+    start_time_embeddings = time.time()
     compute_all_embeddings_parallel(
         input_fasta=args.input_fasta,
         output_folder=args.output_folder,
         size_of_chunk=args.chunk_size,
         num_gpus=args.num_gpus
     )
+    end_time_embeddings = time.time()
+    print(f"Time taken to compute all embeddings: {end_time_embeddings - start_time_embeddings:.2f} seconds")
 
-    create_faiss_database(args.input_fasta, database_folder=args.output_folder, size_of_subdatabases=10000000)
+    start_time_faiss = time.time()
+    create_faiss_database(args.input_fasta, database_folder=args.output_folder, number_of_threads=args.num_cpus, size_of_subdatabases=10000000)
+    end_time_faiss = time.time()
+    print(f"Time taken to create FAISS database: {end_time_faiss - start_time_faiss:.2f} seconds")
 
-    query_results = query_faiss_database(args.input_fasta, number_of_threads=args.num_cpus, database_folder=args.output_folder, query_sequence = "MPPHAARPGPAQNRRGCAMAVMTPRRERSSLLSRALQVTAAAATALVTAVSLAAPAHAANPYERGPNPTDALLEARSGPFSVSEENVSRLGASGFGGGTIYYPRENNTYGAVAISPGYTGTQASVAWLGKRIASHGFVVITIDTITTLDQPDSRARQLNAALDYMINDASSAVRSRIDSSRLAVMGHSMGGGGSLRLASQRPDLKAAIPLTPWHLNKNWSSVRVPTLIIGADLDTIAPVLTHARPFYNSLPTSISKAYLELDGATHFAPNIPNKIIGKYSVAWLKRFVDNDTRYTQFLCPGPRDGLFGEVEEYRSTCPF")
-    print(query_results)
+    print("All done!")
 
