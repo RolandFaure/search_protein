@@ -2,8 +2,9 @@ from create_database import embed_glm2_parallel
 import faiss
 import argparse
 import os
+import torch
 
-def query_faiss_database(input_fasta, database_folder, query_sequence, cutoff=0.2, num_gpus=1):
+def query_faiss_database(input_fasta, database_folder, query_sequence, cutoff=0.2, num_gpus=1, gpus_available=True):
     """
     Queries a FAISS database with a set of sequences and retrieves the nearest neighbors.
 
@@ -19,7 +20,10 @@ def query_faiss_database(input_fasta, database_folder, query_sequence, cutoff=0.
 
     # Embed the query sequences
     print("Embedding query sequences...")
-    query_embeddings = embed_glm2_parallel(([query_sequence], 0))
+    if gpus_available:
+        query_embeddings = embed_glm2_parallel(([query_sequence], 0))
+    else:
+        query_embeddings = embed_glm2_parallel(([query_sequence], "cpu"))
 
     # Load all FAISS indices from the database folder
     print("Querying...")
@@ -70,9 +74,18 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Check if GPUs are available
+    try:
+        gpus_available = torch.cuda.is_available()
+    except ImportError:
+        gpus_available = False
+        print("No GPU available, using CPUs...this could be slow if you have many queries")
+    gpus_available = False
+
     query_results = query_faiss_database(
         input_fasta=args.input_fasta,
         database_folder=args.database,
-        query_sequence=args.query_sequence
+        query_sequence=args.query_sequence,
+        gpus_available=gpus_available
     )
     print(query_results)

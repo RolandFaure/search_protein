@@ -34,7 +34,7 @@ def initialize_model_and_tokenizer(device_id):
             - model (torch.nn.Module): The pre-trained model loaded on the specified device.
             - tokenizer (transformers.PreTrainedTokenizer): The tokenizer associated with the model.
     """
-    device = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(f'cuda:{device_id}' if (torch.cuda.is_available() and device_id != 'cpu') else 'cpu')
     
     model = AutoModel.from_pretrained('tattabio/gLM2_650M_embed', torch_dtype=torch.bfloat16, trust_remote_code=True).to(device)
     tokenizer = AutoTokenizer.from_pretrained('tattabio/gLM2_650M_embed', trust_remote_code=True)
@@ -47,7 +47,7 @@ def embed_glm2_parallel(sequences_device_id):
     Args:
         sequences_device_id (tuple): A tuple containing:
             - sequences (list of str): A list of input sequences to embed.
-            - device_id (int): The ID of the GPU device to use for embedding.
+            - device_id (int or str): The ID of the GPU device to use for embedding, or "cpu" for CPU embedding.
     Returns:
         np.ndarray: A 2D NumPy array containing the embeddings for the input sequences.
                     Each row corresponds to the embedding of a sequence.
@@ -66,7 +66,7 @@ def embed_glm2_parallel(sequences_device_id):
     for i in range(len(sequences)):
         sequences[i] = "<+>" + sequences[i].rstrip('*')
 
-    device = torch.device(f'cuda:{device_id}')
+    device = torch.device(f'cuda:{device_id}' if device_id != "cpu" else "cpu")
     embeddings_array = np.empty((0, d), dtype=np.float32)
     embeddings = torch.empty(0, d, device=device)
     batch_size = 50
@@ -251,65 +251,6 @@ def create_faiss_database(input_fasta, database_folder, number_of_threads=1, siz
     # Process subdatabases in parallel
     with Pool(processes=number_of_threads) as pool:
         pool.starmap(process_subdatabase, tasks)
-
-def query_faiss_database(input_fasta, database_folder, query_sequence, cutoff=0.2, num_gpus=1):
-    """
-    Queries a FAISS database with a set of sequences and retrieves the nearest neighbors.
-
-    Args:
-        database_folder (str): Path to the folder containing FAISS database files (.bin).
-        query_sequences (list of str): List of sequences to query.
-        num_gpus (int, optional): Number of GPUs to use for embedding the query sequences. Defaults to 1.
-
-    Returns:
-        list of list of tuple: A list where each element corresponds to a query sequence and contains
-                                a list of tuples (index, distance) for the nearest neighbors.
-    """
-
-    # Embed the query sequences
-    print("Embedding query sequences...")
-    query_embeddings = embed_glm2_parallel(([query_sequence], 0))
-
-    # Load all FAISS indices from the database folder
-    print("Querying...")
-    results = []
-    faiss_indices = []
-    for file in os.listdir(database_folder):
-        if file.endswith(".bin"):
-
-            file_starting_pos = int(file.strip(".bin").split("_")[2])
-
-            index_path = os.path.join(database_folder, file)
-            index = faiss.read_index(index_path)
-            nb_of_searches = 1
-            distances = []
-            while len(distances) == 0 or distances[0][-1] < cutoff or nb_of_searches > 10 : #loop to increase the number of matches if everything matches
-                distances, indices = index.search(query_embeddings, k=20*2**(nb_of_searches))
-                nb_of_searches+=1
-            results.append([(int(indices[0][j]+file_starting_pos), float(distances[0][j])) for j in range(len(indices[0])) if distances[0][j] < cutoff])
-
-            # Merge and sort all results by distance
-            merged_results = []
-            for result in results:
-                merged_results.extend(result)
-            merged_results.sort(key=lambda x: x[1])  # Sort by distance (second element of tuple)
-
-            # Open the .embeddings file and associate names to distances
-            final_results = []
-            names_file = os.path.join(database_folder, f"{os.path.basename(input_fasta)}.names")
-
-            with open(names_file, "rb") as nf, open(input_fasta, "r") as fastafile:
-                
-                for result in merged_results :
-                    name_positions = []
-                    nf.seek(8*result[0])
-                    position_name = int.from_bytes(nf.read(8), byteorder='little', signed=False)
-
-                    fastafile.seek(position_name)
-                    name_line = fastafile.readline().strip()
-                    final_results.append((name_line, result[1]))
-
-    return final_results
 
 
 if __name__ == "__main__":
