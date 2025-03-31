@@ -155,10 +155,10 @@ def compute_all_embeddings_parallel(input_fasta, output_folder, size_of_chunk=10
                     for chunk in embeddings_chunks:
                         embeddings = np.concatenate((embeddings, chunk), axis=0)
 
-                        for embedding in embeddings:
-                            foe.write(np.array(embedding, dtype=np.float16).tobytes())
-                        for pos in position_in_file:
-                            fon.write(np.array(pos, dtype=np.uint64).tobytes())
+                    for embedding in embeddings:
+                        foe.write(np.array(embedding, dtype=np.float16).tobytes())
+                    for pos in position_in_file:
+                        fon.write(np.array(pos, dtype=np.uint64).tobytes())
 
                     time_end_embedding=time.time()
                     print("Embedded " + str(size_of_chunk*num_gpus) + " sequences in " + str(time_end_embedding-time_start_embedding) + " seconds, which makes " + str(size_of_chunk*num_gpus/(time_end_embedding-time_start_embedding)) + " prot/sec")
@@ -174,10 +174,10 @@ def compute_all_embeddings_parallel(input_fasta, output_folder, size_of_chunk=10
             embeddings = embed_glm2_parallel((sequences, device_id))
             gpu_queue.put(device_id)
 
-            for embedding in embeddings:
-                foe.write(np.array(embedding, dtype=np.float16).tobytes())
-            for pos in position_in_file:
-                fon.write(np.array(pos, dtype=np.uint64).tobytes())
+        for embedding in embeddings:
+            foe.write(np.array(embedding, dtype=np.float16).tobytes())
+        for pos in position_in_file:
+            fon.write(np.array(pos, dtype=np.uint64).tobytes())
 
     return
 
