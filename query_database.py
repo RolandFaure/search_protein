@@ -3,6 +3,7 @@ import faiss
 import argparse
 import os
 import torch
+import time
 
 def query_faiss_database(input_fasta, database_folder, query_sequences, cutoff=0.2, num_gpus=1, gpus_available=True):
     """
@@ -19,11 +20,15 @@ def query_faiss_database(input_fasta, database_folder, query_sequences, cutoff=0
     """
 
     # Embed the query sequences
+    # Time the embedding process
+    start_embedding_time = time.time()
     print("Embedding query sequences...")
     if gpus_available:
         query_embeddings = embed_glm2_parallel((query_sequences, 0))
     else:
         query_embeddings = embed_glm2_parallel((query_sequences, "cpu"))
+    end_embedding_time = time.time()
+        
 
     # Load all FAISS indices from the database folder
     print("Querying...")
@@ -32,6 +37,7 @@ def query_faiss_database(input_fasta, database_folder, query_sequences, cutoff=0
     for file in os.listdir(database_folder):
         if file.endswith(".bin"):
 
+            beginning_bin_time = time.time()
             file_starting_pos = int(file.strip(".bin").split("_")[2])
 
             index_path = os.path.join(database_folder, file)
@@ -41,6 +47,8 @@ def query_faiss_database(input_fasta, database_folder, query_sequences, cutoff=0
             while len(distances) == 0 or distances[0][-1] < cutoff or nb_of_searches > 10 : #loop to increase the number of matches if everything matches
                 distances, indices = index.search(query_embeddings, k=20*2**(nb_of_searches))
                 nb_of_searches+=1
+            
+            end_search_time = time.time()
 
             for i, (dist_row, idx_row) in enumerate(zip(distances, indices)):
                 for dist, idx in zip(dist_row, idx_row):
@@ -48,7 +56,6 @@ def query_faiss_database(input_fasta, database_folder, query_sequences, cutoff=0
                         results[i].append((file_starting_pos + idx, dist))
 
             # sort each row by distance
-            print(results, " lsdj ")
             results_sorted = [sorted(result, key=lambda x: x[1]) for result in results]
 
             # Open the .embeddings file and associate names to distances
@@ -67,6 +74,14 @@ def query_faiss_database(input_fasta, database_folder, query_sequences, cutoff=0
                         name_line = fastafile.readline().strip()
                         sequence_line = fastafile.readline().strip()
                         final_results.append((query_idx, name_line, sequence_line, result[1]))
+
+            end_bin_time = time.time()
+            print(f"Time spent in this bin: {end_bin_time - beginning_bin_time:.2f} seconds")
+            print(f"Time spent in search: {end_search_time - beginning_bin_time:.2f} seconds")
+            print(f"Time spent after search: {time.time() - end_search_time:.2f} seconds")
+    
+    total_time = time.time() - start_embedding_time
+    print(f"Total time taken: {total_time:.2f} seconds")
 
     return final_results
 
@@ -109,15 +124,16 @@ if __name__ == "__main__":
         input_fasta=args.input_fasta,
         database_folder=args.database,
         query_sequences=query_sequences,
-        gpus_available=gpus_available
+        gpus_available=gpus_available,
+        cutoff = 0.01
     )
 
     if args.output_fasta:
         with open(args.output_fasta, "w") as output_file:
             for query, name, sequence, distance in query_results:
-                output_file.write(f"{name} ; query {query} Cosine distance: {distance}\n")
+                output_file.write(f"{name} ; query {query} ; Cosine distance: {distance}\n")
                 output_file.write(f"{sequence}\n")
     else:
-        for name, sequence, distance in query_results:
+        for query, name, sequence, distance in query_results:
             print(f"{name} ; Cosine distance: {distance}")
             print(f"{sequence}")

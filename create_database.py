@@ -20,6 +20,7 @@ import shutil
 
 d = 512
 
+
 def initialize_model_and_tokenizer(device_id):
     """
     Initializes a model and tokenizer for natural language processing tasks.
@@ -40,6 +41,7 @@ def initialize_model_and_tokenizer(device_id):
     tokenizer = AutoTokenizer.from_pretrained('tattabio/gLM2_650M_embed', trust_remote_code=True)
     
     return model, tokenizer
+
 
 def embed_glm2_parallel(sequences_device_id):
     """
@@ -97,7 +99,7 @@ def embed_glm2_parallel(sequences_device_id):
 
     return embeddings_array
 
-def compute_all_embeddings_parallel(input_fasta, output_folder, size_of_chunk=1000000, num_gpus=1):
+def compute_all_embeddings_parallel(input_fasta, output_folder, size_of_chunk=1000000, num_gpus=1, resume=False):
     """
     Compute embeddings for sequences in a FASTA file in parallel using multiple GPUs.
     This function reads sequences from a FASTA file, splits them into chunks, and computes
@@ -133,6 +135,20 @@ def compute_all_embeddings_parallel(input_fasta, output_folder, size_of_chunk=10
     output_file_embeddings = os.path.join(output_folder, f"{os.path.basename(input_fasta)}.embeddings")
     output_file_names = os.path.join(output_folder, f"{os.path.basename(input_fasta)}.names")
 
+     # Check if resuming is enabled and determine the number of already embedded sequences
+    if resume and os.path.exists(output_file_names):
+        with open(output_file_names, "rb") as fon:
+            fon.seek(0, os.SEEK_END)
+            already_embedded_count = fon.tell() // 8  # Each position is stored as uint64 (8 bytes)
+        already_embedded_count -= already_embedded_count % (size_of_chunk*num_gpus)
+
+        with open(output_file_embeddings, "ab") as foe, open(output_file_names, "ab") as fon:
+            foe.truncate(already_embedded_count * d * 2)
+            fon.truncate(already_embedded_count * 8)
+        print(f"Resuming embedding from sequence {already_embedded_count}.")
+    else:
+        already_embedded_count = 0
+
     with open(output_file_embeddings, "ab") as foe , open(output_file_names, "ab") as fon, open(input_fasta) as fi:
 
         line = fi.readline()
@@ -143,28 +159,32 @@ def compute_all_embeddings_parallel(input_fasta, output_folder, size_of_chunk=10
                 sequences.append(line.strip())
                 index += 1
 
-                if index % (size_of_chunk*num_gpus) == 0:
+                if index % (size_of_chunk*num_gpus) == 0 :
 
-                    chunk_sequences = [sequences[i*size_of_chunk : (i+1)*size_of_chunk] for i in range(num_gpus)]
+                    if index > already_embedded_count :
 
-                    time_start_embedding = time.time()
-                    with Pool(processes=num_gpus) as pool:
-                        embeddings_chunks = pool.map(embed_glm2_parallel, [(chunk_sequences[i], i) for i in range(num_gpus)])
-                        
-                    embeddings = np.empty((0, d), dtype=np.float32)
-                    for chunk in embeddings_chunks:
-                        embeddings = np.concatenate((embeddings, chunk), axis=0)
+                        chunk_sequences = [sequences[i*size_of_chunk : (i+1)*size_of_chunk] for i in range(num_gpus)]
 
-                    for embedding in embeddings:
-                        foe.write(np.array(embedding, dtype=np.float16).tobytes())
-                    for pos in position_in_file:
-                        fon.write(np.array(pos, dtype=np.uint64).tobytes())
+                        time_start_embedding = time.time()
+                        with Pool(processes=num_gpus) as pool:
+                            embeddings_chunks = pool.map(embed_glm2_parallel, [(chunk_sequences[i], i) for i in range(num_gpus)])
+                            
+                        embeddings = np.empty((0, d), dtype=np.float32)
+                        for chunk in embeddings_chunks:
+                            embeddings = np.concatenate((embeddings, chunk), axis=0)
 
-                    time_end_embedding=time.time()
-                    print("Embedded " + str(size_of_chunk*num_gpus) + " sequences in " + str(time_end_embedding-time_start_embedding) + " seconds, which makes " + str(size_of_chunk*num_gpus/(time_end_embedding-time_start_embedding)) + " prot/sec")
+                        for embedding in embeddings:
+                            foe.write(np.array(embedding, dtype=np.float16).tobytes())
+                        for pos in position_in_file:
+                            fon.write(np.array(pos, dtype=np.uint64).tobytes())
+
+                        time_end_embedding=time.time()
+                        print("Embedded " + str(size_of_chunk*num_gpus) + " sequences in " + str(time_end_embedding-time_start_embedding) + " seconds, which makes " + str(size_of_chunk*num_gpus/(time_end_embedding-time_start_embedding)) + " prot/sec")
 
                     sequences = []
                     position_in_file = []
+
+                
 
             line = fi.readline()
 
@@ -261,6 +281,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_gpus", type=int, default=0, help="Number of GPUs to use (default: all available).")
     parser.add_argument("--num_cpus", type=int, default=1, help="Number of GPUs to use (default: 1).")
     parser.add_argument("-F", "--force", action="store_true", help="Force overwrite of the output folder if it exists.")
+    parser.add_argument("--resume", action="store_true", help="Resume the embedding process if interrupted.")
 
     args = parser.parse_args()
     print(f"Number of available GPUs: {torch.cuda.device_count()}")
@@ -271,20 +292,23 @@ if __name__ == "__main__":
     multiprocessing.set_start_method('spawn') #to work with CUDA
 
     if os.path.exists(args.output_folder):
-        if not args.force:
+        if not args.force and not args.resume:
             print(f"Output folder '{args.output_folder}' already exists. Use --force to overwrite.")
             sys.exit(1)
-        else:
+        elif not args.resume:
             print("Warning: overwriting a previously existing database")
-        shutil.rmtree(args.output_folder)  
-    os.makedirs(args.output_folder)
+            shutil.rmtree(args.output_folder)  
+
+    if not args.resume:
+        os.makedirs(args.output_folder)
 
     start_time_embeddings = time.time()
     compute_all_embeddings_parallel(
         input_fasta=args.input_fasta,
         output_folder=args.output_folder,
         size_of_chunk=args.chunk_size,
-        num_gpus=args.num_gpus
+        num_gpus=args.num_gpus,
+        resume=args.resume
     )
     end_time_embeddings = time.time()
     print(f"Time taken to compute all embeddings: {end_time_embeddings - start_time_embeddings:.2f} seconds")
