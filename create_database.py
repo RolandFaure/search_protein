@@ -478,27 +478,27 @@ if __name__ == "__main__":
 
     multiprocessing.set_start_method('spawn') #to work with CUDA
 
-    if os.path.exists(args.output_folder):
-        if not args.force and not args.resume:
-            print(f"Output folder '{args.output_folder}' already exists. Use --force to overwrite.")
-            sys.exit(1)
-        elif not args.resume:
-            print("Warning: overwriting a previously existing database")
-            shutil.rmtree(args.output_folder)  
+    # if os.path.exists(args.output_folder):
+    #     if not args.force and not args.resume:
+    #         print(f"Output folder '{args.output_folder}' already exists. Use --force to overwrite.")
+    #         sys.exit(1)
+    #     elif not args.resume:
+    #         print("Warning: overwriting a previously existing database")
+    #         shutil.rmtree(args.output_folder)  
 
-    if not args.resume or not os.path.exists(args.output_folder):
-        os.makedirs(args.output_folder)
+    # if not args.resume or not os.path.exists(args.output_folder):
+    #     os.makedirs(args.output_folder)
 
-    start_time_embeddings = time.time()
-    compute_all_embeddings_parallel(
-        input_fasta=args.input_fasta,
-        output_folder=args.output_folder,
-        size_of_chunk=args.chunk_size,
-        num_gpus=args.num_gpus,
-        resume=args.resume
-    )
-    end_time_embeddings = time.time()
-    print(f"Time taken to compute all embeddings: {end_time_embeddings - start_time_embeddings:.2f} seconds")
+    # start_time_embeddings = time.time()
+    # compute_all_embeddings_parallel(
+    #     input_fasta=args.input_fasta,
+    #     output_folder=args.output_folder,
+    #     size_of_chunk=args.chunk_size,
+    #     num_gpus=args.num_gpus,
+    #     resume=args.resume
+    # )
+    # end_time_embeddings = time.time()
+    # print(f"Time taken to compute all embeddings: {end_time_embeddings - start_time_embeddings:.2f} seconds")
 
     start_time_faiss = time.time()
     create_faiss_database(args.input_fasta, database_folder=args.output_folder, number_of_threads=args.num_cpus, size_of_subdatabases=args.subdatabases_size, resume=args.resume)

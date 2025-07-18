@@ -7,6 +7,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 import numpy as np
 import sys
+import tempfile
+import subprocess
+from collections import defaultdict
 
 __version__= "1.0.1"
 
@@ -31,7 +34,7 @@ def query_bin(bin_file, input_fasta, database_folder, query_embeddings, query_na
         for dist, idx in zip(dist_row, idx_row):
             if dist < cutoff:
                 results[i].append((file_starting_pos + idx, dist))
-                print("in index ", bin_file, " found ", idx, " with a distance of ", dist)
+                # print("in index ", bin_file, " found ", idx, " with a distance of ", dist)
 
     results_sorted = [sorted(result, key=lambda x: x[1]) for result in results]
     final_results = []
@@ -121,6 +124,87 @@ def query_faiss_database(input_fasta, database_folder, query_sequences, query_na
     print(f"Total time taken: {total_time:.2f} seconds")
     return results
 
+def blast_results(results, input_fasta, output_format, output_file, num_threads):
+
+    print("Blasting now...")
+    sequences = {}
+    with open(input_fasta, "r") as f:
+        name = None
+        seq = []
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                if name is not None:
+                    sequences[name] = "".join(seq)
+                name = line
+                seq = []
+            else:
+                seq.append(line)
+        if name is not None:
+            sequences[name] = "".join(seq)
+
+    blast_results_dict = {}
+
+    # Create a temporary directory to store per-sequence databases
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create a FASTA file for each sequence in the input FASTA
+        db_files = {}
+        print("makingbalsts")
+        for name, seq in sequences.items():
+            db_fasta = os.path.join(tmpdir, f"{name.lstrip('>')}.fasta")
+            with open(db_fasta, "w") as dbf:
+                dbf.write(f"{name}\n{seq}\n")
+            # Make BLAST database
+            subprocess.run([
+                "makeblastdb", "-in", db_fasta, "-dbtype", "prot", "-out", db_fasta.rstrip('fasta')+'db'
+            ], check=True)
+            print("makeblast ", db_fasta)
+            db_files[name] = db_fasta
+
+        # For each query, blast against each per-sequence database
+        # Group results by query_name
+        query_to_hits = defaultdict(list)
+        for query_name, hit_name, hit_seq, distance in results:
+            query_to_hits[query_name].append((hit_name, hit_seq, distance))
+
+        total_queries = len(query_to_hits)
+        times = []
+        start_overall = time.time()
+
+        for idx, (query_name, hits) in enumerate(query_to_hits.items(), 1):
+            query_fasta = os.path.join(tmpdir, f"query_{query_name}.fa")
+            with open(query_fasta, "w") as qf:
+                for hit_name, hit_seq, distance in hits:
+                    qf.write(f">{hit_name}\n{hit_seq}\n")
+
+            db_name = os.path.join(tmpdir, f"{query_name.lstrip('>')}.db")
+            blast_out = os.path.join(tmpdir, f"blast_{query_name}_vs_{db_name}.out")
+
+            start = time.time()
+            subprocess.run([
+            "blastp", "-query", query_fasta, "-db", db_fasta,
+            "-outfmt", output_format, "-out", blast_out, "-num_threads", num_threads
+            ], check=True)
+            elapsed = time.time() - start
+            times.append(elapsed)
+
+            # Print ETA after each BLAST run
+            avg_time = sum(times) / len(times)
+            remaining = total_queries - idx
+            eta_seconds = remaining * avg_time
+            eta_minutes = eta_seconds // 60
+            eta_seconds_rem = eta_seconds % 60
+            print(f"Estimated time to complete BLAST for remaining {remaining} queries: {int(eta_minutes)} min {int(eta_seconds_rem)} sec")
+
+            # Append BLAST output to the specified output file or print to stdout
+            with open(blast_out, "r") as bout:
+                if output_file:
+                    with open(output_file, "a") as out_f:
+                        out_f.write(bout.read())
+                else:
+                    print(bout.read())
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Query a FAISS database with a sequence.")
@@ -128,7 +212,8 @@ if __name__ == "__main__":
     parser.add_argument("--input_fasta", required=True, help="Path to the original FASTA file.")
     parser.add_argument("--query_sequences", required=True, help="Fasta file of queris")
     parser.add_argument("--force_cpu", action="store_true", help="Force the use of CPU even if GPUs are available.")
-    parser.add_argument("--output", required=False, help="Path to the output FASTA file. If not provided, results will be printed to stdout.")
+    parser.add_argument("--output", required=False, help="Path to the output file [stdout]")
+    parser.add_argument("--outfmt", type=str, default='6', help="Format of the BLAST output")
     parser.add_argument("-t", "--num_threads", type=int, default=1, help="Number of threads to use for parallel querying.")
     parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss database")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -173,22 +258,29 @@ if __name__ == "__main__":
         max_workers=args.num_threads
     )
 
+    print("sorting the results")
+
     # Sort results by query index and then by ascending distance
     query_results.sort(key=lambda x: (x[0], x[3]))
 
-    if args.output:
-        with open(args.output, "w") as output_file:
-            output_file.write("#query_name\thit_name\tcosine_distance\thit_sequence\n")
-            for query, name, sequence, distance in query_results:
-                # Extract hit name (remove '>' if present)
-                hit_name = name.strip().lstrip('>').split(' ')[0]
-                query_name = query.strip().lstrip('>').split(' ')[0]
-                output_file.write(f"{query_name}\t{hit_name}\t{distance}\t{sequence}\n")
-    else:
-        # Print header
-        print("#query_name\thit_name\tcosine_distance\thit_sequence")
-        for query, name, sequence, distance in query_results:
-            hit_name = name.strip().lstrip('>').split(' ')[0]
-            query_name = query.strip().lstrip('>').split(' ')[0]
-            print(f"{query_name}\t{hit_name}\t{distance}\t{sequence}")
+    print("results sorted")
+
+    blast_results(query_results, args.input_fasta, args.outfmt, args.output, args.num_threads)
+
+
+    # if args.output:
+    #     with open(args.output, "w") as output_file:
+    #         output_file.write("#query_name\thit_name\tcosine_distance\thit_sequence\n")
+    #         for query, name, sequence, distance in query_results:
+    #             # Extract hit name (remove '>' if present)
+    #             hit_name = name.strip().lstrip('>').split(' ')[0]
+    #             query_name = query.strip().lstrip('>').split(' ')[0]
+    #             output_file.write(f"{query_name}\t{hit_name}\t{distance}\t{sequence}\n")
+    # else:
+    #     # Print header
+    #     print("#query_name\thit_name\tcosine_distance\thit_sequence")
+    #     for query, name, sequence, distance in query_results:
+    #         hit_name = name.strip().lstrip('>').split(' ')[0]
+    #         query_name = query.strip().lstrip('>').split(' ')[0]
+    #         print(f"{query_name}\t{hit_name}\t{distance}\t{sequence}")
 
