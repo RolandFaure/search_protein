@@ -4,94 +4,130 @@ import argparse
 import os
 import torch
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
+import numpy as np
+import sys
 
-def query_faiss_database(input_fasta, database_folder, query_sequences, cutoff=0.2, num_gpus=1, gpus_available=True):
+__version__= "1.0.0"
+
+
+def query_bin(bin_file, input_fasta, database_folder, query_embeddings, cutoff):
+    start_time = time.time()
+    faiss.omp_set_num_threads(1)
+
+    file_starting_pos = int(bin_file.strip(".bin").split("_")[2])
+    index_path = os.path.join(database_folder, bin_file)
+    # Load the FAISS index inside the function so each process loads its own copy
+    index = faiss.read_index(index_path)
+    nb_of_searches = 1
+    distances = []
+    while len(distances) == 0 or (distances[0][-1] < cutoff and nb_of_searches <= 10):
+        k = 20 * 2 ** (nb_of_searches)
+        distances, indices = index.search(query_embeddings, k=k)
+        nb_of_searches += 1
+
+    results = [[] for _ in range(len(distances))]
+    for i, (dist_row, idx_row) in enumerate(zip(distances, indices)):
+        for dist, idx in zip(dist_row, idx_row):
+            if dist < cutoff:
+                results[i].append((file_starting_pos + idx, dist))
+
+    results_sorted = [sorted(result, key=lambda x: x[1]) for result in results]
+    final_results = []
+    names_file = os.path.join(database_folder, f"{os.path.basename(input_fasta)}.names")
+    with open(names_file, "rb") as nf, open(input_fasta, "r") as fastafile:
+        for query_idx in range(len(results_sorted)):
+            for result in results_sorted[query_idx]:
+                nf.seek(8 * result[0])
+                position_name = int.from_bytes(nf.read(8), byteorder='little', signed=False)
+                fastafile.seek(position_name)
+                name_line = fastafile.readline().strip()
+                sequence_line = fastafile.readline().strip()
+                final_results.append((query_idx, name_line, sequence_line, result[1]))
+
+    elapsed_time = time.time() - start_time
+    print(f"Time taken for querying bin {bin_file}: {elapsed_time:.2f} seconds")
+    return final_results
+
+def parallel_query_bins(input_fasta, database_folder, query_embeddings, cutoff=0.2, max_workers=4):
+    bin_files = [file for file in os.listdir(database_folder) if file.endswith(".bin")]
+
+    all_results = []
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Copy query_embeddings for each process to avoid shared memory issues
+        futures = [
+            executor.submit(
+            query_bin, bin_file, input_fasta, database_folder, query_embeddings, cutoff
+            )
+            for bin_file in bin_files
+        ]
+        for future in as_completed(futures):
+            all_results.extend(future.result())
+    return all_results
+
+def query_faiss_database(input_fasta, database_folder, query_sequences, cutoff=0.2, num_gpus=1, gpus_available=True, max_workers=4):
     """
-    Queries a FAISS database with a set of sequences and retrieves the nearest neighbors.
+    Queries a FAISS database with a set of sequences and retrieves the nearest neighbors in parallel.
 
     Args:
+        input_fasta (str): Path to the original FASTA file.
         database_folder (str): Path to the folder containing FAISS database files (.bin).
         query_sequences (list of str): List of sequences to query.
         num_gpus (int, optional): Number of GPUs to use for embedding the query sequences. Defaults to 1.
+        gpus_available (bool, optional): Whether GPUs are available. Defaults to True.
+        max_workers (int, optional): Number of parallel workers. Defaults to 4.
 
     Returns:
-        list of list of tuple: A list where each element corresponds to a query sequence and contains
-                                a list of tuples (index, distance) for the nearest neighbors.
+        list of tuple: Each tuple contains (query_idx, name_line, sequence_line, distance).
     """
-
     # Embed the query sequences
-    # Time the embedding process
     start_embedding_time = time.time()
     print("Embedding query sequences...")
-    if gpus_available:
-        query_embeddings = embed_glm2_parallel((query_sequences, 0))
-    else:
-        query_embeddings = embed_glm2_parallel((query_sequences, "cpu"))
+    batch_size = 10
+    query_embeddings_list = []
+    for i in range(340, len(query_sequences), batch_size):
+        print("embedding from ", i)
+        batch = query_sequences[i:i+batch_size]
+        if gpus_available:
+            try:
+                embeddings = embed_glm2_parallel((batch, 0))
+            except RuntimeError as e:
+                embeddings = embed_glm2_parallel((batch, "cpu"))
+        else:
+            embeddings = embed_glm2_parallel((batch, "cpu"))
+        query_embeddings_list.append(embeddings)
+    query_embeddings = np.concatenate(query_embeddings_list, axis=0)
     end_embedding_time = time.time()
-        
+    os.environ["TOKENIZERS_PARALLELISM"] = "false" #just to be safe and make sure tokenizes is not still parallel
 
-    # Load all FAISS indices from the database folder
-    print("Querying...")
-    results = [[] for _ in query_sequences]
-    faiss_indices = []
-    for file in os.listdir(database_folder):
-        if file.endswith(".bin"):
+    print("Querying in parallel...")
+    # Ensure query_embeddings is a CPU numpy array for process pickling
+    if hasattr(query_embeddings, "cpu"):
+        query_embeddings = query_embeddings.cpu()
+    if hasattr(query_embeddings, "numpy"):
+        query_embeddings = query_embeddings.numpy()
+    results = parallel_query_bins(
+        input_fasta=input_fasta,
+        database_folder=database_folder,
+        query_embeddings=query_embeddings,
+        cutoff=cutoff,
+        max_workers=max_workers
+    )
 
-            beginning_bin_time = time.time()
-            file_starting_pos = int(file.strip(".bin").split("_")[2])
-
-            index_path = os.path.join(database_folder, file)
-            index = faiss.read_index(index_path)
-            nb_of_searches = 1
-            distances = []
-            while len(distances) == 0 or distances[0][-1] < cutoff or nb_of_searches > 10 : #loop to increase the number of matches if everything matches
-                distances, indices = index.search(query_embeddings, k=20*2**(nb_of_searches))
-                nb_of_searches+=1
-            
-            end_search_time = time.time()
-
-            for i, (dist_row, idx_row) in enumerate(zip(distances, indices)):
-                for dist, idx in zip(dist_row, idx_row):
-                    if dist < cutoff:
-                        results[i].append((file_starting_pos + idx, dist))
-
-            # sort each row by distance
-            results_sorted = [sorted(result, key=lambda x: x[1]) for result in results]
-
-            # Open the .embeddings file and associate names to distances
-            final_results = []
-            names_file = os.path.join(database_folder, f"{os.path.basename(input_fasta)}.names")
-
-            with open(names_file, "rb") as nf, open(input_fasta, "r") as fastafile:
-                
-                for query_idx in range(len(query_sequences)):
-                    for result in results_sorted[query_idx] :
-                        name_positions = []
-                        nf.seek(8*result[0])
-                        position_name = int.from_bytes(nf.read(8), byteorder='little', signed=False)
-
-                        fastafile.seek(position_name)
-                        name_line = fastafile.readline().strip()
-                        sequence_line = fastafile.readline().strip()
-                        final_results.append((query_idx, name_line, sequence_line, result[1]))
-
-            end_bin_time = time.time()
-            print(f"Time spent in this bin: {end_bin_time - beginning_bin_time:.2f} seconds")
-            print(f"Time spent in search: {end_search_time - beginning_bin_time:.2f} seconds")
-            print(f"Time spent after search: {time.time() - end_search_time:.2f} seconds")
-    
     total_time = time.time() - start_embedding_time
     print(f"Total time taken: {total_time:.2f} seconds")
-
-    return final_results
+    return results
 
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser(description="Query a FAISS database with a sequence.")
     parser.add_argument("--database", required=True, help="Path to the folder containing FAISS database files.")
     parser.add_argument("--input_fasta", required=True, help="Path to the original FASTA file.")
     parser.add_argument("--query_sequences", required=True, help="Fasta file of queris")
     parser.add_argument("--force_cpu", action="store_true", help="Force the use of CPU even if GPUs are available.")
     parser.add_argument("--output_fasta", required=False, help="Path to the output FASTA file. If not provided, results will be printed to stdout.")
+    parser.add_argument("-t", "--num_threads", type=int, default=1, help="Number of threads to use for parallel querying.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
 
@@ -125,8 +161,12 @@ if __name__ == "__main__":
         database_folder=args.database,
         query_sequences=query_sequences,
         gpus_available=gpus_available,
-        cutoff = 0.01
+        cutoff = 0.2,
+        max_workers=args.num_threads
     )
+
+    # Sort results by query index and then by ascending distance
+    query_results.sort(key=lambda x: (x[0], x[3]))
 
     if args.output_fasta:
         with open(args.output_fasta, "w") as output_file:
@@ -137,3 +177,4 @@ if __name__ == "__main__":
         for query, name, sequence, distance in query_results:
             print(f"{name} ; Cosine distance: {distance}")
             print(f"{sequence}")
+
