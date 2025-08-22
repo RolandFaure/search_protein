@@ -10,11 +10,15 @@ import sys
 import tempfile
 import subprocess
 from collections import defaultdict
+import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import pickle
 
-__version__= "1.0.1"
+__version__= "1.1.0"
 
 
-def query_bin(bin_file, input_fasta, database_folder, query_embeddings, query_names, subdatabase_size, cutoff):
+def query_bin(bin_file, original_fasta, database_folder, query_embeddings, query_names, subdatabase_size, cutoff):
     start_time = time.time()
     faiss.omp_set_num_threads(1)
 
@@ -37,8 +41,8 @@ def query_bin(bin_file, input_fasta, database_folder, query_embeddings, query_na
 
     results_sorted = [sorted(result, key=lambda x: x[1]) for result in results]
     final_results = []
-    names_file = os.path.join(database_folder, f"{os.path.basename(input_fasta)}.names")
-    with open(names_file, "rb") as nf, open(input_fasta, "r") as fastafile:
+    names_file = os.path.join(database_folder, f"{os.path.basename(original_fasta)}.names")
+    with open(names_file, "rb") as nf, open(original_fasta, "r") as fastafile:
         for query_idx in range(len(results_sorted)):
             for result in results_sorted[query_idx]:
                 nf.seek(8 * result[0])
@@ -52,28 +56,29 @@ def query_bin(bin_file, input_fasta, database_folder, query_embeddings, query_na
     print(f"Time taken for querying bin {bin_file}: {elapsed_time:.2f} seconds")
     return final_results
 
-def parallel_query_bins(input_fasta, database_folder, query_embeddings, query_names, cutoff=0.2, subdatabase_size=10000000, max_workers=4):
-    bin_files = [file for file in os.listdir(database_folder) if file.endswith(".bin")]
+def parallel_query_bins(original_fasta, database_folder, query_embeddings, query_names, cutoff=0.2, subdatabase_size=10000000, max_workers=4):
+    faiss_database_folder = database_folder+"/faiss"
+    bin_files = [file for file in os.listdir(faiss_database_folder) if file.endswith(".bin")]
 
     all_results = []
+    # for bin_file in bin_files:
+    #     res = query_bin(bin_file, original_fasta, faiss_database_folder, query_embeddings, query_names, subdatabase_size, cutoff)
+    #     all_results += [res]
+    # Ensure query_embeddings is a numpy array for pickling
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Copy query_embeddings for each process to avoid shared memory issues
         futures = [
-            executor.submit(
-            query_bin, bin_file, input_fasta, database_folder, query_embeddings, query_names, subdatabase_size, cutoff
-            )
-            for bin_file in bin_files
+            executor.submit(query_bin, bin_file, original_fasta, faiss_database_folder, query_embeddings, query_names, subdatabase_size, cutoff) for bin_file in bin_files
         ]
         for future in as_completed(futures):
             all_results.extend(future.result())
     return all_results
 
-def query_faiss_database(input_fasta, database_folder, query_sequences, query_names, cutoff=0.2, num_gpus=1, gpus_available=True, subdatabase_size=10000000, max_workers=4):
+def query_faiss_database(original_fasta, database_folder, query_sequences, query_names, cutoff=0.2, num_gpus=1, gpus_available=True, subdatabase_size=10000000, max_workers=4):
     """
     Queries a FAISS database with a set of sequences and retrieves the nearest neighbors in parallel.
 
     Args:
-        input_fasta (str): Path to the original FASTA file.
+        original_fasta (str): Path to the original FASTA file.
         database_folder (str): Path to the folder containing FAISS database files (.bin).
         query_sequences (list of str): List of sequences to query.
         num_gpus (int, optional): Number of GPUs to use for embedding the query sequences. Defaults to 1.
@@ -110,7 +115,7 @@ def query_faiss_database(input_fasta, database_folder, query_sequences, query_na
     if hasattr(query_embeddings, "numpy"):
         query_embeddings = query_embeddings.numpy()
     results = parallel_query_bins(
-        input_fasta=input_fasta,
+        original_fasta=original_fasta,
         database_folder=database_folder,
         query_embeddings=query_embeddings,
         query_names=query_names,
@@ -123,11 +128,55 @@ def query_faiss_database(input_fasta, database_folder, query_sequences, query_na
     print(f"Total time taken: {total_time:.2f} seconds")
     return results
 
-def blast_results(results, input_fasta, output_format, output_file, num_threads):
+def obtain_all_proteins(centroids, database_all_proteins, path_to_centroid_to_prots, num_threads):
+    """
+    For each result, runs an external command to extract proteins and parses the output.
+    Parallelization is limited by the external command and file I/O, but can help if num_threads > 1.
+    """
 
-    print("Blasting now...")
+    def process_result(centroid_name):
+        centroid_id = centroid_name.strip().lstrip('>').split(' ')[0]
+        tmp_filename = f"tmp_{threading.get_ident()}_{centroid_id}.fa"
+        command = f"{path_to_centroid_to_prots} {database_all_proteins} {centroid_id} > {tmp_filename}"
+        subprocess.run(command, shell=True, check=True)
+        proteins = []
+        with open(tmp_filename, "r") as tmp_file:
+            name = None
+            seq = ""
+            for line in tmp_file:
+                line = line.strip()
+                if line.startswith(">"):
+                    if name is not None and seq:
+                        proteins.append((name, seq))
+                    name = line
+                    seq = ""
+                else:
+                    seq = line
+            if name is not None and seq:
+                proteins.append((name, seq))
+        os.remove(tmp_filename)
+        return proteins
+
+    all_results = []
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = [executor.submit(process_result, centroid) for centroid in centroids]
+        for i, future in enumerate(as_completed(futures), 1):
+            proteins = future.result()
+            all_results.extend(proteins)
+        all_results = list(set(all_results))
+        print("At the end, keeping ", len(all_results), " unique hits")
+    
+    return all_results
+        
+
+def mmseqs2_results(results, query_fasta, output_format, output_file, num_threads):
+    """
+    Run MMseqs2 search instead of BLAST for the given results.
+    """
+
+    print("Running MMseqs2 now...")
     sequences = {}
-    with open(input_fasta, "r") as f:
+    with open(query_fasta, "r") as f:
         name = None
         seq = []
         for line in f:
@@ -142,83 +191,71 @@ def blast_results(results, input_fasta, output_format, output_file, num_threads)
         if name is not None:
             sequences[name] = "".join(seq)
 
-    blast_results_dict = {}
-
-    # Create a temporary directory to store per-sequence databases
+    # Create a temporary directory to store files
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Create a FASTA file for each sequence in the input FASTA
-        db_files = {}
-        print("makingbalsts")
-        for name, seq in sequences.items():
-            db_fasta = os.path.join(tmpdir, f"{name.lstrip('>')}.fasta")
-            with open(db_fasta, "w") as dbf:
+        # Write all sequences to a FASTA file (database)
+        db_fasta = os.path.join(tmpdir, "db.fasta")
+        with open(db_fasta, "w") as dbf:
+            for name, seq in sequences.items():
                 dbf.write(f"{name}\n{seq}\n")
-            # Make BLAST database
-            subprocess.run([
-                "makeblastdb", "-in", db_fasta, "-dbtype", "prot", "-out", db_fasta.rstrip('fasta')+'db'
-            ], check=True)
-            print("makeblast ", db_fasta)
-            db_files[name] = db_fasta
 
-        # For each query, blast against each per-sequence database
-        # Group results by query_name
-        query_to_hits = defaultdict(list)
-        for query_name, hit_name, hit_seq, distance in results:
-            query_to_hits[query_name].append((hit_name, hit_seq, distance))
+        # Write all query sequences to a FASTA file
+        query_fasta = os.path.join(tmpdir, "centroids.fasta")
+        with open(query_fasta, "w") as qf:
+            for centroid_name, centroid_seq in results:
+                qf.write(f">{centroid_name.strip()}\n{centroid_seq}\n")
 
-        total_queries = len(query_to_hits)
-        times = []
-        start_overall = time.time()
+        # Create MMseqs2 database
+        db_mmseqs = os.path.join(tmpdir, "db_mmseqs")
+        query_mmseqs = os.path.join(tmpdir, "query_mmseqs")
+        result_mmseqs = os.path.join(tmpdir, "result_mmseqs")
+        tmp_mmseqs = os.path.join(tmpdir, "tmp_mmseqs")
 
-        for idx, (query_name, hits) in enumerate(query_to_hits.items(), 1):
-            query_fasta = os.path.join(tmpdir, f"query_{query_name}.fa")
-            with open(query_fasta, "w") as qf:
-                for hit_name, hit_seq, distance in hits:
-                    qf.write(f">{hit_name}\n{hit_seq}\n")
+        subprocess.run(["mmseqs", "createdb", db_fasta, db_mmseqs], check=True)
+        subprocess.run(["mmseqs", "createdb", query_fasta, query_mmseqs], check=True)
 
-            db_name = os.path.join(tmpdir, f"{query_name.lstrip('>')}.db")
-            blast_out = os.path.join(tmpdir, f"blast_{query_name}_vs_{db_name}.out")
+        print("mmseq created databases ")
 
-            start = time.time()
-            subprocess.run([
-            "blastp", "-query", query_fasta, "-db", db_fasta,
-            "-outfmt", output_format, "-out", blast_out, "-num_threads", num_threads
-            ], check=True)
-            elapsed = time.time() - start
-            times.append(elapsed)
+        # Run MMseqs2 search
+        subprocess.run([
+            "mmseqs", "search", query_mmseqs, db_mmseqs, result_mmseqs, tmp_mmseqs,
+            "--threads", str(num_threads)
+        ], check=True)
 
-            # Print ETA after each BLAST run
-            avg_time = sum(times) / len(times)
-            remaining = total_queries - idx
-            eta_seconds = remaining * avg_time
-            eta_minutes = eta_seconds // 60
-            eta_seconds_rem = eta_seconds % 60
-            print(f"Estimated time to complete BLAST for remaining {remaining} queries: {int(eta_minutes)} min {int(eta_seconds_rem)} sec")
+        # Convert results to tabular format
+        result_tsv = os.path.join(tmpdir, "result.tsv")
+        subprocess.run([
+            "mmseqs", "convertalis", query_mmseqs, db_mmseqs, result_mmseqs, result_tsv,
+            "--format-mode", output_format
+        ], check=True)
 
-            # Append BLAST output to the specified output file or print to stdout
-            with open(blast_out, "r") as bout:
-                if output_file:
-                    with open(output_file, "a") as out_f:
-                        out_f.write(bout.read())
-                else:
-                    print(bout.read())
+        # Output results
+        with open(result_tsv, "r") as resf:
+            if output_file:
+                with open(output_file, "a") as out_f:
+                    out_f.write(resf.read())
+            else:
+                print(resf.read())
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Query a FAISS database with a sequence.")
     parser.add_argument("--database", required=True, help="Path to the folder containing FAISS database files.")
-    parser.add_argument("--input_fasta", required=True, help="Path to the original FASTA file.")
     parser.add_argument("--query_sequences", required=True, help="Fasta file of queris")
     parser.add_argument("--force_cpu", action="store_true", help="Force the use of CPU even if GPUs are available.")
-    parser.add_argument("--output", required=False, help="Path to the output file [stdout]")
-    parser.add_argument("--outfmt", type=str, default='6', help="Format of the BLAST output")
+    parser.add_argument("-o", "--output", required=False, help="Path to the output file [stdout]")
+    parser.add_argument("--outfmt", type=str, default='0', help="Format of the BLAST output")
     parser.add_argument("-t", "--num_threads", type=int, default=1, help="Number of threads to use for parallel querying.")
     parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss database")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
+    path_to_centroid_to_prots = os.path.join(os.path.dirname(__file__), "centroid_to_prots")
 
+    if args.output and os.path.exists(args.output):
+        os.remove(args.output)
+    
     # Check if GPUs are available
     if not args.force_cpu:
         try:
@@ -229,6 +266,8 @@ if __name__ == "__main__":
             print("No GPU available, using CPUs...this could be slow if you have many queries")
     else:
         gpus_available = False
+
+    database = args.database.strip("/")
 
     # Read all sequences from the query FASTA file
     query_sequences = []
@@ -246,9 +285,10 @@ if __name__ == "__main__":
         if sequence_now:
             query_sequences.append(sequence_now)
 
+    t1 = time.time()
     query_results = query_faiss_database(
-        input_fasta=args.input_fasta,
-        database_folder=args.database,
+        original_fasta=database+"/centroids.fa",
+        database_folder=database,
         query_sequences=query_sequences,
         query_names=query_names,
         gpus_available=gpus_available,
@@ -256,30 +296,52 @@ if __name__ == "__main__":
         subdatabase_size=args.subdatabases_size,
         max_workers=args.num_threads
     )
-
-    print("sorting the results")
+    t2 = time.time()
+    print(f"Time for querying FAISS database: {t2 - t1:.2f} seconds. {len(query_results)} centroids")
 
     # Sort results by query index and then by ascending distance
     query_results.sort(key=lambda x: (x[0], x[3]))
 
-    print("results sorted")
+    # with open("query_results.pkl", "wb") as f:
+    #     pickle.dump(query_results, f)
+    # with open("query_results.pkl", "rb") as f:
+    #     query_results = pickle.load(f)
+    # print("query results loaded ", len(query_results))
 
-    blast_results(query_results, args.input_fasta, args.outfmt, args.output, args.num_threads)
+    centroid_hits = list(set([x[1] for x in query_results]))
+    all_results = obtain_all_proteins(centroid_hits, database+"/all_prots", path_to_centroid_to_prots, args.num_threads)
+    t3= time.time()
+    print(f"Time for obtaining all proteins: {t3 - t2:.2f} seconds. {len(all_results)} proteins")
+
+    # with open("all_results.pkl", "wb") as f:
+    #     pickle.dump(all_results, f)
+    # print("all_results pickle dumped")
+    # with open("all_results.pkl", "rb") as f:
+    #     all_results = pickle.load(f)
+    # print("all_results pickle loaded, length:", len(all_results))
+
+    mmseqs2_results(all_results, args.query_sequences, args.outfmt, args.output, args.num_threads)
+    t4 = time.time()
+
+    print(f"Time for querying FAISS database: {t2 - t1:.2f} seconds")
+    print(f"Time for obtaining all proteins: {t3 - t2:.2f} seconds")
+    print(f"Time for running MMseqs2: {t4 - t3:.2f} seconds")
+    print(f"Total time: {t4 - t1:.2f} seconds")
 
 
     # if args.output:
     #     with open(args.output, "w") as output_file:
-    #         output_file.write("#query_name\thit_name\tcosine_distance\thit_sequence\n")
-    #         for query, name, sequence, distance in query_results:
+    #         output_file.write("#query_name\thit_name\thit_sequence\n")
+    #         for query, name, sequence in all_results:
     #             # Extract hit name (remove '>' if present)
     #             hit_name = name.strip().lstrip('>').split(' ')[0]
     #             query_name = query.strip().lstrip('>').split(' ')[0]
-    #             output_file.write(f"{query_name}\t{hit_name}\t{distance}\t{sequence}\n")
+    #             output_file.write(f"{query_name}\t{hit_name}\t{sequence}\n")
     # else:
     #     # Print header
-    #     print("#query_name\thit_name\tcosine_distance\thit_sequence")
-    #     for query, name, sequence, distance in query_results:
+    #     print("#query_name\thit_name\thit_sequence")
+    #     for query, name, sequence, in all_results:
     #         hit_name = name.strip().lstrip('>').split(' ')[0]
     #         query_name = query.strip().lstrip('>').split(' ')[0]
-    #         print(f"{query_name}\t{hit_name}\t{distance}\t{sequence}")
+    #         print(f"{query_name}\t{hit_name}\t{sequence}")
 

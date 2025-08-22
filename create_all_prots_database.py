@@ -77,37 +77,37 @@ tmp_dir = output_dir + "tmp/"
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(tmp_dir, exist_ok=True)
 
-# # First step: compute hashes of all prots and store dict_centroid file positions in num_shards files
-hash_files = [open(f"{tmp_dir}hash_positions_{i}.bin", "wb") for i in range(num_shards)]
+# # # First step: compute hashes of all prots and store dict_centroid file positions in num_shards files
+# hash_files = [open(f"{tmp_dir}hash_positions_{i}.bin", "wb") for i in range(num_shards)]
 
-line_nb = 0
-start_time = time.time()
-with open(dict_centroids, "r") as f:
-   pos = 0
-   while True:
-       line = f.readline()
-       if not line:
-           break
-       centroid, protein = line.strip().split('\t')
-       hash_index = hash(protein) % num_shards
-       # Store the file offset as int64 in the corresponding file
-       hash_files[hash_index].write(struct.pack("Q", pos))  # use 8 bytes for file offset
-       pos += len(line)
-       if line_nb % 1000000 == 0 and line_nb > 0:
-           elapsed = time.time() - start_time
-           lines_per_sec = line_nb / elapsed if elapsed > 0 else 0
-           total_lines = 137_000_000_000
-           remaining = total_lines - line_nb
-           eta_sec = remaining / lines_per_sec if lines_per_sec > 0 else 0
-           eta = datetime.timedelta(seconds=int(eta_sec))
-           print(f"Step 1: processed {line_nb:,} proteins, elapsed: {elapsed/60:.2f} min, ETA: {eta}")
-           sys.stdout.flush()
-       line_nb += 1
+# line_nb = 0
+# start_time = time.time()
+# with open(dict_centroids, "r") as f:
+#    pos = 0
+#    while True:
+#        line = f.readline()
+#        if not line:
+#            break
+#        centroid, protein = line.strip().split('\t')
+#        hash_index = hash(protein) % num_shards
+#        # Store the file offset as int64 in the corresponding file
+#        hash_files[hash_index].write(struct.pack("Q", pos))  # use 8 bytes for file offset
+#        pos += len(line)
+#        if line_nb % 1000000 == 0 and line_nb > 0:
+#            elapsed = time.time() - start_time
+#            lines_per_sec = line_nb / elapsed if elapsed > 0 else 0
+#            total_lines = 137_000_000_000
+#            remaining = total_lines - line_nb
+#            eta_sec = remaining / lines_per_sec if lines_per_sec > 0 else 0
+#            eta = datetime.timedelta(seconds=int(eta_sec))
+#            print(f"Step 1: processed {line_nb:,} proteins, elapsed: {elapsed/60:.2f} min, ETA: {eta}")
+#            sys.stdout.flush()
+#        line_nb += 1
 
-for hf in hash_files:
-   hf.close()
+# for hf in hash_files:
+#    hf.close()
 
-print("sharded the centroid dict")
+# print("sharded the centroid dict")
 
 # # Second step: shard each input file in different pieces
 # def process_input_file(input_file):
@@ -263,59 +263,22 @@ print("sharded the centroid dict")
 
 # process_shard(shard_idx)
 
-# # After all shards are processed, integrate any remaining tmp files into the final zstd files
-# def sort_output_file(shard_idx):
-#     start_time = time.time()
+# After all shards are processed, integrate any remaining tmp files into the final zstd files
+def sort_output_file(shard_idx):
+    start_time = time.time()
 
-#     input_file = os.path.join(tmp_dir, f"centroid_{shard_idx}.fa")
-#     sorted_file = os.path.join(output_dir, f"centroid_{shard_idx}.sorted.fa.zst")
-#     command = f"sed '/^*$/d' {input_file} | sed '/^$/d' | grep -A1 --no-group-separator '^>' | paste - - | sort -k1,1 | awk '!seen[$0]++' | tr '\\t' '\\n' | zstd > {sorted_file}"
-#     subprocess.run(command, shell=True, check=True)
+    input_file = os.path.join(tmp_dir, f"centroid_{shard_idx}.fa")
+    sorted_file = os.path.join(output_dir, f"centroid_{shard_idx}.sorted.fa.zst")
+    command = f"sed '/^*$/d' {input_file} | sed '/^$/d' | grep -A1 --no-group-separator '^>' | paste - - | sort -k1,1 | awk '!seen[$0]++' | tr '\\t' '\\n' | zstd > {sorted_file}"
+    subprocess.run(command, shell=True, check=True)
 
-#     elapsed = time.time() - start_time
-#     print(f"sorted and recompressed {sorted_file} in {elapsed:.2f} seconds")
+    elapsed = time.time() - start_time
+    print(f"sorted and recompressed {sorted_file} in {elapsed:.2f} seconds")
 
-# print("number of cpus: ", num_threads)
-# with ProcessPoolExecutor(max_workers=num_threads) as executor:
-#     executor.map(sort_output_file, range(shard_idx*100, min(num_centroids_shards, shard_idx*100+100)))
-# print("Sorted all centroid output files by record name")
-
-# def create_centroid_index(sorted_file):
-#     index = {}
-#     position = 0
-#     with open(sorted_file, "rb") as f:
-#         dctx = zstd.ZstdDecompressor()
-#         with dctx.stream_reader(f) as reader:
-#             text_reader = io.TextIOWrapper(reader)
-#             while True:
-#                 line = text_reader.readline()
-#                 if not line:
-#                     break
-#                 if line.startswith(">"):
-#                     centroid = line[1:].split()[0]
-#                     if centroid not in index:
-#                         index[centroid] = position
-#                 position = reader.tell()
-#     return index
-
-# def index_shard(shard):
-#     sorted_file = os.path.join(output_dir, f"centroid_{shard}.sorted.fa.zst")
-#     if not os.path.exists(sorted_file):
-#         return
-#     print(f"Indexing {sorted_file}")
-#     index = create_centroid_index(sorted_file)
-
-#     idx_file = os.path.join(output_dir, f"centroid_{shard}.index.tsv")
-#     with open(idx_file, "w") as fidx:
-#         for centroid, pos in index.items():
-#             fidx.write(f"{centroid}\t{pos}\n")
-
-#     print(f"Saved index to {pkl_file}")
-
-
-# with ThreadPoolExecutor(max_workers=num_threads) as executor:
-#     executor.map(index_shard, range(shard_idx*50, min(num_centroids_shards, shard_idx*50+50)))
-
+print("number of cpus: ", num_threads)
+with ProcessPoolExecutor(max_workers=num_threads) as executor:
+    executor.map(sort_output_file, range(shard_idx*100, min(num_centroids_shards, shard_idx*100+100)))
+print("Sorted all centroid output files by record name")
 
 
 

@@ -14,7 +14,6 @@ namespace fs = std::filesystem;
 #include <future>
 #include <random>
 
-
 using namespace::std;
 
 // Global file locks for thread safety
@@ -147,6 +146,21 @@ void process_input_file_for_shard(
               << " in " << elapsed << " seconds. In total, dispatched " << number_of_dispatched_proteins << " and did not find " << number_of_missed_proteins << " proteins." << std::endl;
 }
 
+/**
+ * @brief Processes a shard of protein data by loading centroid mappings and processing input files in parallel.
+ *
+ * This function performs the following steps:
+ * 1. Loads line positions from a binary file corresponding to the shard.
+ * 2. Loads a dictionary mapping proteins to centroids using the loaded positions.
+ * 3. Processes all input files assigned to the shard in parallel using multiple threads.
+ *
+ * @param shard_idx Index of the current shard being processed.
+ * @param dict_centroids Path to the file containing centroid dictionary entries.
+ * @param input_files Vector of input file paths to be processed for this shard.
+ * @param num_threads Number of threads to use for parallel processing of input files.
+ * @param num_centroids_shards Total number of centroid shards.
+ * @param tmp_dir Temporary directory path for intermediate files.
+ */
 void process_shard(
     int shard_idx,
     const std::string& dict_centroids,
@@ -155,6 +169,7 @@ void process_shard(
     int num_centroids_shards,
     std::string tmp_dir)
 {
+
     std::unordered_map<std::string, std::string> prot_to_centroid_dict;
     std::vector<uint64_t> line_positions;
 
@@ -254,6 +269,82 @@ void process_shard(
     for (auto& t : threads) t.join();
 }
 
+void split_centroid_file(std::string shard_idx){
+    string file_to_split = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/centroid_"+shard_idx+".sorted.fa.zst";
+    cout << " splitting " << file_to_split << endl;
+    std::string remove_dir_cmd = "rm /pasteur/appa/scratch/rfaure/all_prots/proteins_human/centroid_" + shard_idx + "/*";
+    std::system(remove_dir_cmd.c_str());
+    fs::create_directory("/pasteur/appa/scratch/rfaure/all_prots/proteins_human/centroid_" + shard_idx);
+
+    std::ifstream infile(file_to_split);
+    if (!infile) {
+        std::cerr << "ERROR: Cannot open " << file_to_split << std::endl;
+        return;
+    }
+
+    std::vector<std::ofstream> outfiles(1000);
+    for (int i = 0; i < 1000; ++i) {
+        std::string outname = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/centroid_" + shard_idx+ "/" + std::to_string(i) + ".fa";
+        outfiles[i].open(outname, std::ios::out);
+        if (!outfiles[i]) {
+            std::cerr << "ERROR: Cannot create " << outname << std::endl;
+            return;
+        }
+    }
+
+    std::string line, header, sequence;
+    // Decompress the .zst file to a temporary file
+    std::string tmp_decompressed = file_to_split + ".tmp_decompressed";
+    std::string decompress_cmd = "zstd -d -c " + file_to_split + " > " + tmp_decompressed;
+    int ret = std::system(decompress_cmd.c_str());
+    if (ret != 0) {
+        std::cerr << "ERROR: Failed to decompress " << file_to_split << std::endl;
+        return;
+    }
+
+    std::ifstream infile_dec(tmp_decompressed);
+    if (!infile_dec) {
+        std::cerr << "ERROR: Cannot open decompressed file " << tmp_decompressed << std::endl;
+        std::remove(tmp_decompressed.c_str());
+        return;
+    }
+
+    while (std::getline(infile_dec, line)) {
+        if (line.empty()) continue;
+        if (line[0] == '>') {
+            header = line;
+            if (!std::getline(infile_dec, sequence)){
+                break;
+            }
+            std::string centroid_name = header.substr(1);
+            size_t space_pos = centroid_name.find(' ');
+            if (space_pos != std::string::npos){
+                centroid_name = centroid_name.substr(0, space_pos);
+            }
+            int hash_val = (simple_string_hash(centroid_name) / 10000) % 1000;
+            outfiles[hash_val] << header << "\n" << sequence << "\n";
+        }
+    }
+
+    infile_dec.close();
+    std::remove(tmp_decompressed.c_str());
+
+    for (auto& f : outfiles) f.close();
+
+    std::string compress_cmd = "zstd -f /pasteur/appa/scratch/rfaure/all_prots/proteins_human/centroid_" + shard_idx + "/*.fa";
+    ret = std::system(compress_cmd.c_str());
+    if (ret != 0) {
+        std::cerr << "ERROR: Failed to zstd compress files in centroid_" << shard_idx << std::endl;
+    }
+
+    // Remove the non-compressed files
+    std::string remove_cmd = "rm /pasteur/appa/scratch/rfaure/all_prots/proteins_human/centroid_" + shard_idx + "/*.fa";
+    ret = std::system(remove_cmd.c_str());
+    if (ret != 0) {
+        std::cerr << "ERROR: Failed to remove non-compressed files in centroid_" << shard_idx << std::endl;
+    }
+}
+
 int main(int argc, char* argv[]) {
 
     if (argc != 2) {
@@ -270,12 +361,12 @@ int main(int argc, char* argv[]) {
     }
 
     const int num_shards = 100;
-    int num_threads = 48;
+    int num_threads = 24;
     int num_centroids_shards = 10000;
-    const std::string file_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.fa";
+    const std::string file_centroids = "/pasteur/appa/scratch/rfaure/human-complete.fa";
     const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs/";
-    const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv";
-    const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/";
+    const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv";
+    const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/";
 
     //// Test configuration for all_prots_test
     // const int num_shards = 2;
@@ -286,21 +377,25 @@ int main(int argc, char* argv[]) {
     // const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/all_prots_test/centroid.tsv";
     // const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots_test/proteins/";
 
-    const std::string tmp_dir = output_dir + "tmp/";
+    // const std::string tmp_dir = output_dir + "tmp/";
 
-    std::vector<std::string> input_files;
-    for (const auto& entry : fs::directory_iterator(input_folder)) {
-        if (entry.is_regular_file()) {
-            std::string filename = entry.path().filename().string();
-            if (filename.rfind("nonhuman", 0) == 0 && filename.size() >= 4 &&
-                filename.substr(filename.size() - 3) == "zst") {
-                input_files.push_back(entry.path().string());
-            }
-        }
+    // std::vector<std::string> input_files;
+    // for (const auto& entry : fs::directory_iterator(input_folder)) {
+    //     if (entry.is_regular_file()) {
+    //         std::string filename = entry.path().filename().string();
+    //         if (filename.rfind("human", 0) == 0 && filename.size() >= 4 &&
+    //             filename.substr(filename.size() - 3) == "zst") {
+    //             input_files.push_back(entry.path().string());
+    //         }
+    //     }
+    // }
+
+    // process_shard(shard_idx, dict_centroids, input_files, num_threads, num_centroids_shards, tmp_dir);
+
+    for (int i = 100*shard_idx ; i<= 100*(shard_idx+1) ; i++){
+        split_centroid_file(std::to_string(i));
     }
-
-    process_shard(shard_idx, dict_centroids, input_files, num_threads, num_centroids_shards, tmp_dir);
-
+  
     cout << "FINISHED SHARD " << shard_idx << endl;
 
 }

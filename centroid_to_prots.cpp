@@ -29,7 +29,7 @@ int main(int argc, char* argv[]) {
     auto centroid_hash = simple_string_hash(centroid_id)%10000;
 
     try {
-        std::string filename = std::string(argv[1])+"/centroid_"+std::to_string(centroid_hash)+".sorted.fa.zst";
+        std::string filename = std::string(argv[1])+"/centroid_"+std::to_string(centroid_hash)+"/"+std::to_string((simple_string_hash(centroid_id)/10000)%1000)+".fa.zst";
         std::string cmd = "zstdcat " + filename;
         FILE* pipe = popen(cmd.c_str(), "r");
         if (!pipe) {
@@ -51,7 +51,7 @@ int main(int argc, char* argv[]) {
             if (!line.empty() && line[0] == '>') {
                 if (!header.empty() && !sequence.empty()) {
                     // Check if header starts with the centroid_id
-                    if (header.compare(1, centroid_id.size(), centroid_id) == 0) {
+                    if (header.substr(1, centroid_id.size()) == centroid_id) {
                         std::cout << header << '\n' << sequence << '\n';
                     }
                 }

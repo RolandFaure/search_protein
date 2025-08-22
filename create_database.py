@@ -459,13 +459,13 @@ def create_faiss_database(input_fasta, database_folder, number_of_threads=1, siz
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compute embeddings for sequences in a FASTA file using gLM2 model.")
+    parser = argparse.ArgumentParser(description="Compute embeddings for sequences in a FASTA file using gLM2 model, and index them in a FAISS database.")
     parser.add_argument("input_fasta", type=str, help="Path to the input FASTA file.")
     parser.add_argument("output_folder", type=str, help="Path to the output folder where embeddings will be saved.")
     parser.add_argument("--chunk_size", type=int, default=1000000, help="Number of sequences per chunk (default: 100000).")
     parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss database")
     parser.add_argument("--num_gpus", type=int, default=0, help="Number of GPUs to use (default: all available).")
-    parser.add_argument("--num_cpus", type=int, default=1, help="Number of GPUs to use (default: 1).")
+    parser.add_argument("--num_cpus", type=int, default=1, help="Number of CPUs to use (default: 1).")
     parser.add_argument("-F", "--force", action="store_true", help="Force overwrite of the output folder if it exists.")
     parser.add_argument("--resume", action="store_true", help="Resume the embedding process if interrupted.")
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
