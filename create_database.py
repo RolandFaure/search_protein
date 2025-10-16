@@ -68,7 +68,7 @@ def embed_glm2_parallel(sequences_device_id):
     for i in range(len(sequences)):
         sequences[i] = "<+>" + sequences[i].rstrip('*')
 
-    device = torch.device(f'cuda:{device_id}' if device_id != "cpu" else "cpu")
+    device = torch.device(f'cuda:{device_id}' if (torch.cuda.is_available() and device_id != "cpu") else "cpu")
     embeddings_array = np.empty((0, d), dtype=np.float32)
     embeddings = torch.empty(0, d, device=device)
     batch_size = 50
@@ -82,6 +82,7 @@ def embed_glm2_parallel(sequences_device_id):
         with torch.no_grad():
             attention_mask = encodings.attention_mask.bool().to(device) #this is very important to handle the padding correctly
             pooled_embeds = model(encodings.input_ids.to(device), attention_mask=attention_mask).pooler_output
+        print("Embedded ", min(seq_start + batch_size, len(sequences)), " sequences")
 
         embeddings = torch.cat((embeddings, pooled_embeds), dim=0)
 
@@ -418,7 +419,10 @@ def create_faiss_database(input_fasta, database_folder, number_of_threads=1, siz
 
     empty_index_file = os.path.join(database_folder, "faiss_index_empty.bins")
     if not resume or not os.path.exists(empty_index_file):
-        if total_vectors < 50000000 :
+        if True : #test the flat index
+            print("WARNING: indexing using flat index to compare the results")
+            index = faiss.index_factory(d, "Flat" )
+        elif total_vectors < 50000000 :
             print("WARNING: indexing using HNSW because less than 5M vectors")
             index = faiss.index_factory(d, "HNSW,Flat" )
         else:

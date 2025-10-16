@@ -14,8 +14,9 @@ import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pickle
+import csv
 
-__version__= "1.1.0"
+__version__= "1.1.1"
 
 
 def query_bin(bin_file, original_fasta, database_folder, query_embeddings, query_names, subdatabase_size, cutoff):
@@ -137,7 +138,7 @@ def obtain_all_proteins(centroids, database_all_proteins, path_to_centroid_to_pr
     def process_result(centroid_name):
         centroid_id = centroid_name.strip().lstrip('>').split(' ')[0]
         tmp_filename = f"tmp_{threading.get_ident()}_{centroid_id}.fa"
-        command = f"{path_to_centroid_to_prots} {database_all_proteins} {centroid_id} > {tmp_filename}"
+        command = f"{path_to_centroid_to_prots} {database_all_proteins} {centroid_id} | awk -F'>' '{{ if ($1==\"\") {{ if (NF>=3) print \">\"$2; else print $0 }} else {{ print $1 }} }}' > {tmp_filename}"
         subprocess.run(command, shell=True, check=True)
         proteins = []
         with open(tmp_filename, "r") as tmp_file:
@@ -155,6 +156,7 @@ def obtain_all_proteins(centroids, database_all_proteins, path_to_centroid_to_pr
             if name is not None and seq:
                 proteins.append((name, seq))
         os.remove(tmp_filename)
+
         return proteins
 
     all_results = []
@@ -168,7 +170,6 @@ def obtain_all_proteins(centroids, database_all_proteins, path_to_centroid_to_pr
     
     return all_results
         
-
 def mmseqs2_results(results, query_fasta, output_format, output_file, num_threads):
     """
     Run MMseqs2 search instead of BLAST for the given results.
@@ -193,17 +194,17 @@ def mmseqs2_results(results, query_fasta, output_format, output_file, num_thread
 
     # Create a temporary directory to store files
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Write all sequences to a FASTA file (database)
+        # Write all query sequences to a FASTA file (database)
         db_fasta = os.path.join(tmpdir, "db.fasta")
         with open(db_fasta, "w") as dbf:
             for name, seq in sequences.items():
                 dbf.write(f"{name}\n{seq}\n")
 
-        # Write all query sequences to a FASTA file
-        query_fasta = os.path.join(tmpdir, "centroids.fasta")
+        # Write all results sequences to a FASTA file
+        query_fasta = os.path.join(tmpdir, "target.fasta")
         with open(query_fasta, "w") as qf:
-            for centroid_name, centroid_seq in results:
-                qf.write(f">{centroid_name.strip()}\n{centroid_seq}\n")
+            for name, seq in results:
+                qf.write(f">{"".join(name.split()[1:])}#{name.split()[0][1:]}\n{seq}\n")
 
         # Create MMseqs2 database
         db_mmseqs = os.path.join(tmpdir, "db_mmseqs")
@@ -232,7 +233,7 @@ def mmseqs2_results(results, query_fasta, output_format, output_file, num_thread
         # Output results
         with open(result_tsv, "r") as resf:
             if output_file:
-                with open(output_file, "a") as out_f:
+                with open(output_file, "w") as out_f:
                     out_f.write(resf.read())
             else:
                 print(resf.read())
@@ -257,7 +258,7 @@ if __name__ == "__main__":
         os.remove(args.output)
     
     # Check if GPUs are available
-    if not args.force_cpu:
+    if not args.force_cpu :
         try:
             gpus_available = torch.cuda.is_available()
             print("GPU available, moving on")
@@ -302,6 +303,36 @@ if __name__ == "__main__":
     # Sort results by query index and then by ascending distance
     query_results.sort(key=lambda x: (x[0], x[3]))
 
+    # Output query_results as an intermediate FASTA file
+    if args.output:
+        intermediate_fasta = args.output + ".intermediate.fasta"
+    else:
+        intermediate_fasta = "query_results_intermediate.fasta"
+    with open(intermediate_fasta, "w") as fasta_file:
+        for query_name, centroid_name, sequence, distance in query_results:
+            fasta_file.write(f"{centroid_name}#{query_name}{sequence}\n")
+    print(f"Intermediate FASTA file written: {intermediate_fasta}")
+
+    tsv_output = args.output + ".tsv" if args.output else "query_results.tsv"
+    with open(tsv_output, "w") as tsvfile:
+        tsvfile.write("#query_name\tresult_name\tresult_sequences\tcosine_distance\n")
+        for query_name, centroid_name, sequence, distance in query_results:
+            tsvfile.write(f"{query_name.strip()}\t{centroid_name.strip()[1:].split()[0]}\t{sequence}\t{distance}\n")
+    print(f"TSV file written: {tsv_output}")
+
+    # Write a deduplicated intermediate FASTA file (unique centroid name/seq pairs)
+    if args.output:
+        unique_fasta = args.output + ".unique_centroids.fasta"
+    else:
+        unique_fasta = "unique_centroids.fasta"
+    unique_centroids = set()
+    for _, centroid_name, sequence, _ in query_results:
+        unique_centroids.add((centroid_name, sequence))
+    with open(unique_fasta, "w") as fasta_file:
+        for centroid_name, sequence in unique_centroids:
+            fasta_file.write(f"{centroid_name}\n{sequence}\n")
+    print(f"Unique centroid FASTA file written: {unique_fasta}")
+    
     # with open("query_results.pkl", "wb") as f:
     #     pickle.dump(query_results, f)
     # with open("query_results.pkl", "rb") as f:
@@ -311,17 +342,31 @@ if __name__ == "__main__":
     centroid_hits = list(set([x[1] for x in query_results]))
     all_results = obtain_all_proteins(centroid_hits, database+"/all_prots", path_to_centroid_to_prots, args.num_threads)
     t3= time.time()
-    print(f"Time for obtaining all proteins: {t3 - t2:.2f} seconds. {len(all_results)} proteins")
+    # print(f"Time for obtaining all proteins: {t3 - t2:.2f} seconds. {len(all_results)} proteins")
 
-    # with open("all_results.pkl", "wb") as f:
-    #     pickle.dump(all_results, f)
-    # print("all_results pickle dumped")
-    # with open("all_results.pkl", "rb") as f:
-    #     all_results = pickle.load(f)
-    # print("all_results pickle loaded, length:", len(all_results))
+    with open("all_results.pkl", "wb") as f:
+        pickle.dump(all_results, f)
+    print("all_results pickle dumped")
+    with open("all_results.pkl", "rb") as f:
+        all_results = pickle.load(f)
+    print("all_results pickle loaded, length:", len(all_results))
 
-    mmseqs2_results(all_results, args.query_sequences, args.outfmt, args.output, args.num_threads)
+    if args.output:
+        fasta_output = args.output + ".fasta"
+    else:
+        fasta_output = "results.fasta"
+
+    with open(fasta_output, "w") as fasta_file:
+        for name, seq in all_results:
+            if '>' in seq:
+                print("WHWUHIA ", seq)
+            fasta_file.write(f">{"".join(name.split()[1:])}#{name.split()[0][1:]}\n{seq}\n")
+
+    mmseqs2_results(all_results, args.query_sequences, args.outfmt, args.output+".mmseqs2", args.num_threads)
     t4 = time.time()
+
+    command = "awk '!seen[$1]++' " + args.output+".mmseqs2" + " > " + args.output + ".top_hit" #to keep only the first hit
+    subprocess.run(command, shell=True, check=True)
 
     print(f"Time for querying FAISS database: {t2 - t1:.2f} seconds")
     print(f"Time for obtaining all proteins: {t3 - t2:.2f} seconds")

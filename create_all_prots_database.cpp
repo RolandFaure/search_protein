@@ -48,7 +48,7 @@ void process_input_file_for_shard(
 {
     auto start_time = std::chrono::steady_clock::now();
     std::string base = fs::path(input_file).filename().string();
-    std::string shard_file = tmp_dir + base.substr(0, base.size() - 4) + "_shard_" + std::to_string(shard_idx) + ".fa";
+    std::string shard_file = tmp_dir + base + "_shard_" + std::to_string(shard_idx) + ".fa";
     if (!fs::exists(shard_file)) {
         return;
     }
@@ -63,8 +63,9 @@ void process_input_file_for_shard(
             if (line.empty() || line[0] != '>') continue;
             std::string protein_id = line.substr(1);
             size_t space_pos = protein_id.find(' ');
-            if (space_pos != std::string::npos)
+            if (space_pos != std::string::npos){
                 protein_id = protein_id.substr(0, space_pos);
+            }
             if (prot_to_centroid_dict.find(protein_id) != prot_to_centroid_dict.end()) {
                 last_dispatched_protein_id = protein_id;
             }
@@ -105,8 +106,9 @@ void process_input_file_for_shard(
         if (header_line.empty() || header_line[0] != '>') continue;
         std::string protein_id = header_line.substr(1);
         size_t space_pos = protein_id.find(' ');
-        if (space_pos != std::string::npos)
+        if (space_pos != std::string::npos){
             protein_id = protein_id.substr(0, space_pos);
+        }
 
         auto it = prot_to_centroid_dict.find(protein_id);
         if (it == prot_to_centroid_dict.end()) {
@@ -142,7 +144,7 @@ void process_input_file_for_shard(
     }
 
     auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
-    std::cout << "In shard " << shard_idx << ", just dispatched " << input_file
+    std::cout << "In shard " << shard_idx << ", just dispatched " << shard_file
               << " in " << elapsed << " seconds. In total, dispatched " << number_of_dispatched_proteins << " and did not find " << number_of_missed_proteins << " proteins." << std::endl;
 }
 
@@ -241,16 +243,9 @@ void process_shard(
     size_t file_count = input_files.size();
     std::atomic<size_t> next_file(0);
 
-    std::cout << "Input files for shard " << shard_idx << ":" << std::endl;
-    for (const auto& file : input_files) {
-        std::cout << "  " << file << std::endl;
-    }
-
-
-
     auto worker = [&]() {
         while (true) {
-            size_t idx = next_file.fetch_add(1);
+            size_t idx = next_file.fetch_add(1); //increment in a thread-safe way
             if (idx >= file_count) break;
             process_input_file_for_shard(
                 input_files[idx],
@@ -269,12 +264,22 @@ void process_shard(
     for (auto& t : threads) t.join();
 }
 
-void split_centroid_file(std::string shard_idx){
-    string file_to_split = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/centroid_"+shard_idx+".sorted.fa.zst";
+void sort_and_split_centroid_file(std::string shard_idx, std::string output_dir){
+    string file_to_split = output_dir + "tmp/centroid_"+shard_idx+".fa";
+
+    std::string sort_cmd = "awk '{cur=$0; if(length(cur)<3){prev=\"\"; next}; if(prev!=\"\")print prev; prev=cur} END{if(prev!=\"\")print prev}' " + file_to_split +
+        " | grep -A1 --no-group-separator '^>' | paste - - | sort -k1,1 | awk '!seen[$0]++' | tr '\\t' '\\n' > " + file_to_split + ".sorted";
+    int sort_ret = std::system(sort_cmd.c_str());
+    if (sort_ret != 0) {
+        std::cerr << "ERROR: Failed to sort " << file_to_split << std::endl;
+        return;
+    }
+    file_to_split = file_to_split + ".sorted";
+
     cout << " splitting " << file_to_split << endl;
-    std::string remove_dir_cmd = "rm /pasteur/appa/scratch/rfaure/all_prots/proteins_human/centroid_" + shard_idx + "/*";
+    std::string remove_dir_cmd = "rm " + output_dir + "centroid_" + shard_idx + "/*";
     std::system(remove_dir_cmd.c_str());
-    fs::create_directory("/pasteur/appa/scratch/rfaure/all_prots/proteins_human/centroid_" + shard_idx);
+    fs::create_directory(output_dir + "centroid_" + shard_idx);
 
     std::ifstream infile(file_to_split);
     if (!infile) {
@@ -284,7 +289,7 @@ void split_centroid_file(std::string shard_idx){
 
     std::vector<std::ofstream> outfiles(1000);
     for (int i = 0; i < 1000; ++i) {
-        std::string outname = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/centroid_" + shard_idx+ "/" + std::to_string(i) + ".fa";
+        std::string outname = output_dir + "centroid_" + shard_idx+ "/" + std::to_string(i) + ".fa";
         outfiles[i].open(outname, std::ios::out);
         if (!outfiles[i]) {
             std::cerr << "ERROR: Cannot create " << outname << std::endl;
@@ -292,23 +297,13 @@ void split_centroid_file(std::string shard_idx){
         }
     }
 
-    std::string line, header, sequence;
-    // Decompress the .zst file to a temporary file
-    std::string tmp_decompressed = file_to_split + ".tmp_decompressed";
-    std::string decompress_cmd = "zstd -d -c " + file_to_split + " > " + tmp_decompressed;
-    int ret = std::system(decompress_cmd.c_str());
-    if (ret != 0) {
-        std::cerr << "ERROR: Failed to decompress " << file_to_split << std::endl;
-        return;
-    }
-
-    std::ifstream infile_dec(tmp_decompressed);
+    std::ifstream infile_dec(file_to_split);
     if (!infile_dec) {
-        std::cerr << "ERROR: Cannot open decompressed file " << tmp_decompressed << std::endl;
-        std::remove(tmp_decompressed.c_str());
+        std::cerr << "ERROR: Cannot open decompressed file " << file_to_split << std::endl;
         return;
     }
 
+    std::string line, header, sequence;
     while (std::getline(infile_dec, line)) {
         if (line.empty()) continue;
         if (line[0] == '>') {
@@ -327,21 +322,26 @@ void split_centroid_file(std::string shard_idx){
     }
 
     infile_dec.close();
-    std::remove(tmp_decompressed.c_str());
 
     for (auto& f : outfiles) f.close();
 
-    std::string compress_cmd = "zstd -f /pasteur/appa/scratch/rfaure/all_prots/proteins_human/centroid_" + shard_idx + "/*.fa";
-    ret = std::system(compress_cmd.c_str());
+    std::string compress_cmd = "zstd -f " + output_dir + "centroid_" + shard_idx + "/*.fa";
+    auto ret = std::system(compress_cmd.c_str());
     if (ret != 0) {
         std::cerr << "ERROR: Failed to zstd compress files in centroid_" << shard_idx << std::endl;
     }
 
     // Remove the non-compressed files
-    std::string remove_cmd = "rm /pasteur/appa/scratch/rfaure/all_prots/proteins_human/centroid_" + shard_idx + "/*.fa";
+    std::string remove_cmd = "rm " + output_dir + "centroid_" + shard_idx + "/*.fa";
     ret = std::system(remove_cmd.c_str());
     if (ret != 0) {
         std::cerr << "ERROR: Failed to remove non-compressed files in centroid_" << shard_idx << std::endl;
+    }
+
+    std::string remove_sorted_cmd = "rm " + file_to_split;
+    ret = std::system(remove_sorted_cmd.c_str());
+    if (ret != 0) {
+        std::cerr << "ERROR: Failed to remove sorted file " << file_to_split << std::endl;
     }
 }
 
@@ -363,7 +363,6 @@ int main(int argc, char* argv[]) {
     const int num_shards = 100;
     int num_threads = 24;
     int num_centroids_shards = 10000;
-    const std::string file_centroids = "/pasteur/appa/scratch/rfaure/human-complete.fa";
     const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs/";
     const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv";
     const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/";
@@ -377,24 +376,28 @@ int main(int argc, char* argv[]) {
     // const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/all_prots_test/centroid.tsv";
     // const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots_test/proteins/";
 
-    // const std::string tmp_dir = output_dir + "tmp/";
+    const std::string tmp_dir = output_dir + "tmp/";
 
-    // std::vector<std::string> input_files;
-    // for (const auto& entry : fs::directory_iterator(input_folder)) {
-    //     if (entry.is_regular_file()) {
-    //         std::string filename = entry.path().filename().string();
-    //         if (filename.rfind("human", 0) == 0 && filename.size() >= 4 &&
-    //             filename.substr(filename.size() - 3) == "zst") {
-    //             input_files.push_back(entry.path().string());
-    //         }
-    //     }
-    // }
-
-    // process_shard(shard_idx, dict_centroids, input_files, num_threads, num_centroids_shards, tmp_dir);
-
-    for (int i = 100*shard_idx ; i<= 100*(shard_idx+1) ; i++){
-        split_centroid_file(std::to_string(i));
+    std::vector<std::string> input_files;
+    for (const auto& entry : fs::directory_iterator(input_folder)) {
+        if (entry.is_regular_file()) {
+            std::string filename = entry.path().filename().string();
+            if (filename.rfind("nonhuman", 0) == 0 && filename.size() >= 4 && filename.substr(filename.size() - 4) == ".zst") {
+                input_files.push_back(entry.path().string().substr(0, entry.path().string().size() - 4));
+            }
+        }
     }
+
+    std::cout << "Input files for shard " << shard_idx << ":" << std::endl;
+    for (const auto& file : input_files) {
+        std::cout << "  " << file << std::endl;
+    }
+
+    process_shard(shard_idx, dict_centroids, input_files, num_threads, num_centroids_shards, tmp_dir);
+
+    // for (int i = 100*shard_idx ; i<= 100*(shard_idx+1) ; i++){
+    //     sort_and_split_centroid_file(std::to_string(i), output_dir);
+    // }
   
     cout << "FINISHED SHARD " << shard_idx << endl;
 

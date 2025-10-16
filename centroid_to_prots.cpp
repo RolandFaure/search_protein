@@ -6,6 +6,7 @@
 #include <vector>
 #include <sstream>
 
+using namespace::std;
 
 // simple string hash (explicitely code it so that we can easily export it to pyton)
 uint32_t simple_string_hash(const std::string& s) {
@@ -30,6 +31,7 @@ int main(int argc, char* argv[]) {
 
     try {
         std::string filename = std::string(argv[1])+"/centroid_"+std::to_string(centroid_hash)+"/"+std::to_string((simple_string_hash(centroid_id)/10000)%1000)+".fa.zst";
+        cout << "looking in " << filename << endl;
         std::string cmd = "zstdcat " + filename;
         FILE* pipe = popen(cmd.c_str(), "r");
         if (!pipe) {
