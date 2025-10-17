@@ -360,12 +360,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // const int num_shards = 100;
+    // int num_threads = 24;
+    // int num_centroids_shards = 10000;
+    // const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs/";
+    // const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv";
+    // const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/";
+
     const int num_shards = 100;
     int num_threads = 24;
     int num_centroids_shards = 10000;
     const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs/";
-    const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv";
-    const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/";
+    const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv";
+    const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/";
 
     //// Test configuration for all_prots_test
     // const int num_shards = 2;
