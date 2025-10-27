@@ -22,11 +22,15 @@ if hash('1') != -6863858015672933803:
     print(hash('1'))
     sys.exit(1)
 
-if len(sys.argv) != 1:
-    print("Usage: python create_all_prots_database.py")
+print("got: ", " ".join(sys.argv))
+sys.stdout.flush()
+if len(sys.argv) != 3:
+    print("Usage: python create_all_prots_database.py <shard_idx> <num_parallel_jobs>")
     sys.exit(1)
 
 file_locks = {}
+global_shard_idx = int(sys.argv[1])
+num_parallel_jobs = int(sys.argv[2])
 
 # num_shards= 100
 # num_threads = 30
@@ -38,7 +42,7 @@ file_locks = {}
 # output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/"
 
 num_shards= 100
-num_threads = 50
+num_threads = 1
 num_centroids_shards = 10000
 file_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.fa"
 input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs/"
@@ -62,7 +66,7 @@ output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/"
 # print(f"file_centroids = {file_centroids}")
 # print(f"input_folder = {input_folder}")
 # print(f"dict_centroids = {dict_centroids}")
-# print(f"input_files = glob.glob(os.path.join(input_folder, \"nonhuman*.zst\"))")
+# print(f"input_files = glob.glob(osvim.path.join(input_folder, \"nonhuman*.zst\"))")
 # print(f"output_dir = {output_dir}")
 
 tmp_dir = output_dir + "tmp/"
@@ -124,9 +128,11 @@ def process_input_file(input_file):
     
     print("just sharded ", input_file)
 
+# Filter input files based on the global shard index and number of parallel jobs
+input_files = [f for f in input_files if (hash(os.path.basename(f)) % num_parallel_jobs) == global_shard_idx]
 with ThreadPoolExecutor(max_workers=num_threads) as executor:
     executor.map(process_input_file, input_files)
-print("sharded the protein files")
+print("sharded the protein files ", global_shard_idx, " / ", num_parallel_jobs)
 
 
 

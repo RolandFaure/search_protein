@@ -238,6 +238,51 @@ def mmseqs2_results(results, query_fasta, output_format, output_file, num_thread
             else:
                 print(resf.read())
 
+        # Parse MMseqs2 tabular results to collect matched query IDs and write a FASTA
+        matched_queries = set()
+        with open(result_tsv, "r") as resf:
+            for line in resf:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                cols = line.split("\t")
+                if len(cols) >= 1:
+                    matched_queries.add(cols[0].lstrip(">"))
+
+        # Read the query (target) FASTA we created and keep only matched entries
+        matched_records = []
+        with open(query_fasta, "r") as qf:
+            header = None
+            seq_lines = []
+            for line in qf:
+                line = line.rstrip("\n")
+                if line.startswith(">"):
+                    if header is not None:
+                        h_full = header.lstrip(">")
+                        h_first = h_full.split()[0]
+                        if h_full in matched_queries or h_first in matched_queries:
+                            matched_records.append((header, "".join(seq_lines)))
+                    header = line
+                    seq_lines = []
+                else:
+                    seq_lines.append(line.strip())
+            if header is not None:
+                h_full = header.lstrip(">")
+                h_first = h_full.split()[0]
+                if h_full in matched_queries or h_first in matched_queries:
+                    matched_records.append((header, "".join(seq_lines)))
+
+        # Write matched proteins to a FASTA file
+        if output_file:
+            matched_fasta = output_file + ".matched_proteins.fasta"
+        else:
+            matched_fasta = os.path.join(tmpdir, "matched_proteins.fasta")
+
+        with open(matched_fasta, "w") as mf:
+            for header, seq in matched_records:
+                mf.write(f"{header}\n{seq}\n")
+
+        print(f"Wrote {len(matched_records)} matched proteins to {matched_fasta}")
 
 if __name__ == "__main__":
 

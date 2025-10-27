@@ -13,6 +13,8 @@ namespace fs = std::filesystem;
 #include <thread>
 #include <future>
 #include <random>
+#include <sys/file.h>
+#include <unistd.h>
 
 using namespace::std;
 
@@ -100,8 +102,9 @@ void process_input_file_for_shard(
 
     std::ifstream fasta_handle(shard_file);
     if (!fasta_handle) return;
-
     std::string header_line;
+    std::unordered_map<std::string, std::vector<std::pair<std::string, std::string>>> buffer_map;
+
     while (std::getline(fasta_handle, header_line)) {
         if (header_line.empty() || header_line[0] != '>') continue;
         std::string protein_id = header_line.substr(1);
@@ -111,35 +114,91 @@ void process_input_file_for_shard(
         }
 
         auto it = prot_to_centroid_dict.find(protein_id);
+        std::string output_file;
+        std::string new_desc;
         if (it == prot_to_centroid_dict.end()) {
             if (number_of_missed_proteins <= 10){
                 std::cerr << "ERROR 330: " << protein_id << " is not in shard " << shard_idx
                         << " but is found in " << shard_file << std::endl;
             }
-            // Skip sequence line
-            std::string skip_seq;
-            std::getline(fasta_handle, skip_seq);
+            output_file = tmp_dir + "centroid_unknown_" + std::to_string(shard_idx) + ".fa";
             number_of_missed_proteins += 1;
-            continue;
+            new_desc = "UNKNOWN_CENTROID "+ header_line.substr(1);
         }
-        number_of_dispatched_proteins += 1;
-        const std::string& centroid = it->second;
-        // size_t centroid_hash = std::hash<std::string>{}(centroid) % num_centroids_shards;
-        int centroid_hash = simple_string_hash(centroid) % num_centroids_shards;
-        std::string output_file = tmp_dir + "centroid_" + std::to_string(centroid_hash) + ".fa";
-
-        // Build new description
-        auto new_desc = centroid + " " + header_line.substr(1);
+        else{
+            const std::string& centroid = it->second;
+            int centroid_hash = simple_string_hash(centroid) % num_centroids_shards;
+            output_file = tmp_dir + "centroid_" + std::to_string(centroid_hash) + ".fa";
+            number_of_dispatched_proteins += 1;
+            new_desc = centroid + " " + header_line.substr(1);
+        }
 
         std::string sequence;
         std::getline(fasta_handle, sequence);
 
-        // Lock file for thread safety
-        std::mutex& lock = get_file_lock(output_file);
-        {
-            std::lock_guard<std::mutex> guard(lock);
+        // Add to buffer
+        buffer_map[output_file].emplace_back(new_desc, sequence);
+
+        // Write to file if buffer size reaches 10000
+        if (buffer_map[output_file].size() >= 10000) {
             std::ofstream out_handle(output_file, std::ios::app);
-            out_handle << ">" << new_desc << "\n" << sequence << "\n";
+            if (!out_handle) {
+                std::cerr << "ERROR: Cannot open " << output_file << " for writing." << std::endl;
+                continue;
+            }
+
+            int fd = open(output_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd == -1) {
+                std::cerr << "ERROR: Cannot open " << output_file << std::endl;
+                continue;
+            }
+
+            while (flock(fd, LOCK_EX) == -1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+
+            std::string buffer_content;
+            for (const auto& entry : buffer_map[output_file]) {
+                buffer_content += ">" + entry.first + "\n" + entry.second + "\n";
+            }
+            write(fd, buffer_content.c_str(), buffer_content.size());
+
+            if (flock(fd, LOCK_UN) == -1) {
+                std::cerr << "ERROR: Failed to unlock file " << output_file << std::endl;
+            }
+
+            buffer_map[output_file].clear();
+        }
+    }
+
+    // Write remaining buffered lines
+    for (auto& [output_file, buffer] : buffer_map) {
+        if (!buffer.empty()) {
+            std::ofstream out_handle(output_file, std::ios::app);
+            if (!out_handle) {
+                std::cerr << "ERROR: Cannot open " << output_file << " for writing." << std::endl;
+                continue;
+            }
+
+            int fd = open(output_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd == -1) {
+                std::cerr << "ERROR: Cannot open " << output_file << std::endl;
+                continue;
+            }
+
+            while (flock(fd, LOCK_EX) == -1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+
+            std::string buffer_content;
+            for (const auto& entry : buffer_map[output_file]) {
+                buffer_content += ">" + entry.first + "\n" + entry.second + "\n";
+            }
+            write(fd, buffer_content.c_str(), buffer_content.size());
+
+            if (flock(fd, LOCK_UN) == -1) {
+                std::cerr << "ERROR: Failed to unlock file " << output_file << std::endl;
+            }
         }
     }
 
@@ -264,87 +323,6 @@ void process_shard(
     for (auto& t : threads) t.join();
 }
 
-void sort_and_split_centroid_file(std::string shard_idx, std::string output_dir){
-    string file_to_split = output_dir + "tmp/centroid_"+shard_idx+".fa";
-
-    std::string sort_cmd = "awk '{cur=$0; if(length(cur)<3){prev=\"\"; next}; if(prev!=\"\")print prev; prev=cur} END{if(prev!=\"\")print prev}' " + file_to_split +
-        " | grep -A1 --no-group-separator '^>' | paste - - | sort -k1,1 | awk '!seen[$0]++' | tr '\\t' '\\n' > " + file_to_split + ".sorted";
-    int sort_ret = std::system(sort_cmd.c_str());
-    if (sort_ret != 0) {
-        std::cerr << "ERROR: Failed to sort " << file_to_split << std::endl;
-        return;
-    }
-    file_to_split = file_to_split + ".sorted";
-
-    cout << " splitting " << file_to_split << endl;
-    std::string remove_dir_cmd = "rm " + output_dir + "centroid_" + shard_idx + "/*";
-    std::system(remove_dir_cmd.c_str());
-    fs::create_directory(output_dir + "centroid_" + shard_idx);
-
-    std::ifstream infile(file_to_split);
-    if (!infile) {
-        std::cerr << "ERROR: Cannot open " << file_to_split << std::endl;
-        return;
-    }
-
-    std::vector<std::ofstream> outfiles(1000);
-    for (int i = 0; i < 1000; ++i) {
-        std::string outname = output_dir + "centroid_" + shard_idx+ "/" + std::to_string(i) + ".fa";
-        outfiles[i].open(outname, std::ios::out);
-        if (!outfiles[i]) {
-            std::cerr << "ERROR: Cannot create " << outname << std::endl;
-            return;
-        }
-    }
-
-    std::ifstream infile_dec(file_to_split);
-    if (!infile_dec) {
-        std::cerr << "ERROR: Cannot open decompressed file " << file_to_split << std::endl;
-        return;
-    }
-
-    std::string line, header, sequence;
-    while (std::getline(infile_dec, line)) {
-        if (line.empty()) continue;
-        if (line[0] == '>') {
-            header = line;
-            if (!std::getline(infile_dec, sequence)){
-                break;
-            }
-            std::string centroid_name = header.substr(1);
-            size_t space_pos = centroid_name.find(' ');
-            if (space_pos != std::string::npos){
-                centroid_name = centroid_name.substr(0, space_pos);
-            }
-            int hash_val = (simple_string_hash(centroid_name) / 10000) % 1000;
-            outfiles[hash_val] << header << "\n" << sequence << "\n";
-        }
-    }
-
-    infile_dec.close();
-
-    for (auto& f : outfiles) f.close();
-
-    std::string compress_cmd = "zstd -f " + output_dir + "centroid_" + shard_idx + "/*.fa";
-    auto ret = std::system(compress_cmd.c_str());
-    if (ret != 0) {
-        std::cerr << "ERROR: Failed to zstd compress files in centroid_" << shard_idx << std::endl;
-    }
-
-    // Remove the non-compressed files
-    std::string remove_cmd = "rm " + output_dir + "centroid_" + shard_idx + "/*.fa";
-    ret = std::system(remove_cmd.c_str());
-    if (ret != 0) {
-        std::cerr << "ERROR: Failed to remove non-compressed files in centroid_" << shard_idx << std::endl;
-    }
-
-    std::string remove_sorted_cmd = "rm " + file_to_split;
-    ret = std::system(remove_sorted_cmd.c_str());
-    if (ret != 0) {
-        std::cerr << "ERROR: Failed to remove sorted file " << file_to_split << std::endl;
-    }
-}
-
 int main(int argc, char* argv[]) {
 
     if (argc != 2) {
@@ -363,14 +341,14 @@ int main(int argc, char* argv[]) {
     // const int num_shards = 100;
     // int num_threads = 24;
     // int num_centroids_shards = 10000;
-    // const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs/";
+    // const std::string input_folder = "/pasteur/appa/scratch/rfaure/orfs";
     // const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv";
     // const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/";
 
     const int num_shards = 100;
-    int num_threads = 24;
+    int num_threads = std::thread::hardware_concurrency()*2; //over-use the CPUs to exploit the fact that thread wait for I/O on disk
     int num_centroids_shards = 10000;
-    const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs/";
+    const std::string input_folder = "/pasteur/appa/scratch/rfaure/orfs";
     const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv";
     const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/";
 
@@ -401,10 +379,6 @@ int main(int argc, char* argv[]) {
     }
 
     process_shard(shard_idx, dict_centroids, input_files, num_threads, num_centroids_shards, tmp_dir);
-
-    // for (int i = 100*shard_idx ; i<= 100*(shard_idx+1) ; i++){
-    //     sort_and_split_centroid_file(std::to_string(i), output_dir);
-    // }
   
     cout << "FINISHED SHARD " << shard_idx << endl;
 
