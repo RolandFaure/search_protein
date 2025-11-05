@@ -28,25 +28,23 @@ if len(sys.argv) != 1:
 
 file_locks = {}
 
-# num_shards= 100
-# num_threads = 30
-# num_centroids_shards = 10000
-# file_centroids = "/pasteur/appa/scratch/rfaure/human-complete.fa"
-# input_folder = "/pasteur/appa/scratch/rfaure/orfs"
-# dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv" #tab-separated files with two fields: 1/centroid 2/
-# input_files = glob.glob(os.path.join(input_folder, "human*.zst"))
-# output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/"
-
 num_shards= 100
 num_centroids_shards = 10000
-file_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.fa"
-input_folder = "/pasteur/appa/scratch/rfaure/orfs"
-dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv" #tab-separated files with two fields: 1/centroid 2/
-input_files = glob.glob(os.path.join(input_folder, "nonhuman*.zst"))
-output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/"
+file_centroids = "/pasteur/appa/scratch/rfaure/human-complete.fa"
+input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs"
+dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv" #tab-separated files with two fields: 1/centroid 2/
+input_files = glob.glob(os.path.join(input_folder, "human*.zst"))
+output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/"
+
+# num_shards= 100
+# num_centroids_shards = 10000
+# file_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.fa"
+# input_folder = "/pasteur/appa/scratch/rfaure/orfs"
+# dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv" #tab-separated files with two fields: 1/centroid 2/
+# input_files = glob.glob(os.path.join(input_folder, "nonhuman*.zst"))
+# output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/"
 
 # num_shards= 2
-# num_threads = 10
 # num_centroids_shards = 2
 # input_folder = "/pasteur/appa/scratch/rfaure/all_prots_test"
 # input_files = glob.glob(os.path.join(input_folder, "*.zst"))
@@ -56,7 +54,6 @@ output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/"
 
 # print("Parameters:")
 # print(f"num_shards = {num_shards}")
-# print(f"num_threads = {num_threads}")
 # print(f"num_centroids_shards = {num_centroids_shards}")
 # print(f"file_centroids = {file_centroids}")
 # print(f"input_folder = {input_folder}")

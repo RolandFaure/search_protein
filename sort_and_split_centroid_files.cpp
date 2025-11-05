@@ -32,7 +32,7 @@ uint32_t simple_string_hash(const std::string& s) {
 void sort_and_split_centroid_file(std::string shard_idx, std::string output_dir){
     string file_to_split = output_dir + "tmp/centroid_"+shard_idx+".fa";
 
-    std::string sort_cmd = "awk '{cur=$0; if(length(cur)<3){prev=\"\"; next}; if(prev!=\"\")print prev; prev=cur} END{if(prev!=\"\")print prev}' " + file_to_split +
+    std::string sort_cmd = "awk 'BEGIN{OFS=\"\\t\"}/^>/{if(seq!=\"\")print header,seq;header=$0;seq=\"\";next}NF{if(seq==\"\")seq=$0}END{if(seq!=\"\")print header,seq}' " + file_to_split +
         " | grep -A1 --no-group-separator '^>' | paste - - | sort -k1,1 | awk '!seen[$0]++' | tr '\\t' '\\n' > " + file_to_split + ".sorted";
     int sort_ret = std::system(sort_cmd.c_str());
     if (sort_ret != 0) {
@@ -41,7 +41,7 @@ void sort_and_split_centroid_file(std::string shard_idx, std::string output_dir)
     }
     file_to_split = file_to_split + ".sorted";
 
-    cout << " splitting " << file_to_split << endl;
+    // cout << " splitting " << file_to_split << endl;
     std::string remove_dir_cmd = "rm " + output_dir + "centroid_" + shard_idx + "/*";
     std::system(remove_dir_cmd.c_str());
     fs::create_directory(output_dir + "centroid_" + shard_idx);
@@ -82,6 +82,9 @@ void sort_and_split_centroid_file(std::string shard_idx, std::string output_dir)
                 centroid_name = centroid_name.substr(0, space_pos);
             }
             int hash_val = (simple_string_hash(centroid_name) / 10000) % 1000;
+            // if (centroid_name == "SRR5325889_239_2"){
+            //     cout << "sequences " << header << " goes with " << sequence.substr(0,10) << "..." << endl;
+            // }
             outfiles[hash_val] << header << "\n" << sequence << "\n";
         }
     }
@@ -112,6 +115,9 @@ void sort_and_split_centroid_file(std::string shard_idx, std::string output_dir)
 
 int main(int argc, char* argv[]) {
 
+    // sort_and_split_centroid_file("3218", "/pasteur/appa/scratch/rfaure/all_prots/proteins3/");
+    // exit(1);
+
     if (argc != 2) {
         std::cerr << "Usage: sort_and_split_centroid_files <shard_idx>" << std::endl;
         return 1;
@@ -125,19 +131,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // const int num_shards = 100;
-    // int num_threads = 24;
-    // int num_centroids_shards = 10000;
-    // const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs/";
-    // const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv";
-    // const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/";
-
     const int num_shards = 100;
     int num_threads = 24;
     int num_centroids_shards = 10000;
-    const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs/";
-    const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv";
-    const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/";
+    const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs";
+    const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv";
+    const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/";
+
+    // const int num_shards = 100;
+    // int num_threads = 24;
+    // int num_centroids_shards = 10000;
+    // const std::string input_folder = "/pasteur/appa/scratch/rfaure/orfs";
+    // const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv";
+    // const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/";
 
     //// Test configuration for all_prots_test
     // const int num_shards = 2;

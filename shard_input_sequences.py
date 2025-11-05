@@ -32,23 +32,23 @@ file_locks = {}
 global_shard_idx = int(sys.argv[1])
 num_parallel_jobs = int(sys.argv[2])
 
-# num_shards= 100
-# num_threads = 30
-# num_centroids_shards = 10000
-# file_centroids = "/pasteur/appa/scratch/rfaure/human-complete.fa"
-# input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs/"
-# dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv" #tab-separated files with two fields: 1/centroid 2/
-# input_files = glob.glob(os.path.join(input_folder, "human*.zst"))
-# output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/"
-
 num_shards= 100
 num_threads = 1
 num_centroids_shards = 10000
-file_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.fa"
+file_centroids = "/pasteur/appa/scratch/rfaure/human-complete.fa"
 input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs/"
-dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv" #tab-separated files with two fields: 1/centroid 2/
-input_files = glob.glob(os.path.join(input_folder, "nonhuman*.zst"))
-output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/"
+dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv" #tab-separated files with two fields: 1/centroid 2/
+input_files = glob.glob(os.path.join(input_folder, "human*.zst"))
+output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/"
+
+# num_shards= 100
+# num_threads = 1
+# num_centroids_shards = 10000
+# file_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.fa"
+# input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs/"
+# dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv" #tab-separated files with two fields: 1/centroid 2/
+# input_files = glob.glob(os.path.join(input_folder, "nonhuman*.zst"))
+# output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/"
 
 # num_shards= 2
 # num_threads = 10

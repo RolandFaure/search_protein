@@ -6,6 +6,7 @@ namespace fs = std::filesystem;
 
 #include <fstream>
 #include <sstream>
+#include <cstring>
 #include <mutex>
 #include <map>
 #include <atomic>
@@ -141,16 +142,11 @@ void process_input_file_for_shard(
 
         // Write to file if buffer size reaches 10000
         if (buffer_map[output_file].size() >= 10000) {
-            std::ofstream out_handle(output_file, std::ios::app);
-            if (!out_handle) {
-                std::cerr << "ERROR: Cannot open " << output_file << " for writing." << std::endl;
-                continue;
-            }
 
             int fd = open(output_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
             if (fd == -1) {
-                std::cerr << "ERROR: Cannot open " << output_file << std::endl;
-                continue;
+                std::cerr << "ERROR 450: Cannot open " << output_file << ": " << strerror(errno) << std::endl;
+                exit(1);
             }
 
             while (flock(fd, LOCK_EX) == -1) {
@@ -165,7 +161,9 @@ void process_input_file_for_shard(
 
             if (flock(fd, LOCK_UN) == -1) {
                 std::cerr << "ERROR: Failed to unlock file " << output_file << std::endl;
+                exit(1);
             }
+            close(fd);
 
             buffer_map[output_file].clear();
         }
@@ -174,16 +172,11 @@ void process_input_file_for_shard(
     // Write remaining buffered lines
     for (auto& [output_file, buffer] : buffer_map) {
         if (!buffer.empty()) {
-            std::ofstream out_handle(output_file, std::ios::app);
-            if (!out_handle) {
-                std::cerr << "ERROR: Cannot open " << output_file << " for writing." << std::endl;
-                continue;
-            }
 
             int fd = open(output_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
             if (fd == -1) {
-                std::cerr << "ERROR: Cannot open " << output_file << std::endl;
-                continue;
+                std::cerr << "ERROR 450: Cannot open " << output_file << ": " << strerror(errno) << std::endl;
+                exit(1);
             }
 
             while (flock(fd, LOCK_EX) == -1) {
@@ -199,6 +192,7 @@ void process_input_file_for_shard(
             if (flock(fd, LOCK_UN) == -1) {
                 std::cerr << "ERROR: Failed to unlock file " << output_file << std::endl;
             }
+            close(fd);
         }
     }
 
@@ -338,19 +332,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    const int num_shards = 100;
+    int num_threads = std::thread::hardware_concurrency()*2;
+    int num_centroids_shards = 10000;
+    const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs";
+    const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv";
+    const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/";
+
     // const int num_shards = 100;
-    // int num_threads = 24;
+    // int num_threads = std::thread::hardware_concurrency()*2; //over-use the CPUs to exploit the fact that thread wait for I/O on disk
     // int num_centroids_shards = 10000;
     // const std::string input_folder = "/pasteur/appa/scratch/rfaure/orfs";
-    // const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv";
-    // const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/";
-
-    const int num_shards = 100;
-    int num_threads = std::thread::hardware_concurrency()*2; //over-use the CPUs to exploit the fact that thread wait for I/O on disk
-    int num_centroids_shards = 10000;
-    const std::string input_folder = "/pasteur/appa/scratch/rfaure/orfs";
-    const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv";
-    const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/";
+    // const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv";
+    // const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/";
 
     //// Test configuration for all_prots_test
     // const int num_shards = 2;
@@ -367,7 +361,7 @@ int main(int argc, char* argv[]) {
     for (const auto& entry : fs::directory_iterator(input_folder)) {
         if (entry.is_regular_file()) {
             std::string filename = entry.path().filename().string();
-            if (filename.rfind("nonhuman", 0) == 0 && filename.size() >= 4 && filename.substr(filename.size() - 4) == ".zst") {
+            if (filename.rfind("human", 0) == 0 && filename.size() >= 4 && filename.substr(filename.size() - 4) == ".zst") {
                 input_files.push_back(entry.path().string().substr(0, entry.path().string().size() - 4));
             }
         }

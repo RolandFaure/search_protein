@@ -493,21 +493,21 @@ if __name__ == "__main__":
     if not args.resume or not os.path.exists(args.output_folder):
         os.makedirs(args.output_folder)
 
-    # start_time_embeddings = time.time()
-    # compute_all_embeddings_parallel(
-    #     input_fasta=args.input_fasta,
-    #     output_folder=args.output_folder,
-    #     size_of_chunk=args.chunk_size,
-    #     num_gpus=args.num_gpus,
-    #     resume=args.resume
-    # )
-    # end_time_embeddings = time.time()
-    # print(f"Time taken to compute all embeddings: {end_time_embeddings - start_time_embeddings:.2f} seconds")
+    start_time_embeddings = time.time()
+    compute_all_embeddings_parallel(
+        input_fasta=args.input_fasta,
+        output_folder=args.output_folder,
+        size_of_chunk=args.chunk_size,
+        num_gpus=args.num_gpus,
+        resume=args.resume
+    )
+    end_time_embeddings = time.time()
+    print(f"Time taken to compute all embeddings: {end_time_embeddings - start_time_embeddings:.2f} seconds")
 
-    start_time_faiss = time.time()
-    create_faiss_database(args.input_fasta, database_folder=args.output_folder, number_of_threads=args.num_cpus, size_of_subdatabases=args.subdatabases_size, resume=args.resume)
-    end_time_faiss = time.time()
-    print(f"Time taken to create FAISS database: {end_time_faiss - start_time_faiss:.2f} seconds")
+    # start_time_faiss = time.time()
+    # create_faiss_database(args.input_fasta, database_folder=args.output_folder, number_of_threads=args.num_cpus, size_of_subdatabases=args.subdatabases_size, resume=args.resume)
+    # end_time_faiss = time.time()
+    # print(f"Time taken to create FAISS database: {end_time_faiss - start_time_faiss:.2f} seconds")
 
     print("All done!")
 
