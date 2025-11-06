@@ -31,44 +31,21 @@ int main(int argc, char* argv[]) {
 
     try {
         std::string filename = std::string(argv[1])+"/centroid_"+std::to_string(centroid_hash)+"/"+std::to_string((simple_string_hash(centroid_id)/10000)%1000)+".fa.zst";
-        cout << "lookiddssng centroidto prot in " << filename << endl;
-        std::string cmd = "zstdcat " + filename;
+        std::string cmd = "zstdcat " + filename + " | grep -A1 '^>" + centroid_id + "'";
+        
         FILE* pipe = popen(cmd.c_str(), "r");
         if (!pipe) {
-            throw std::runtime_error("Failed to run zstdcat command");
+            throw std::runtime_error("Failed to run command");
         }
-        std::string file_content;
+        
         char buffer[4096];
         while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            file_content += buffer;
+            std::cout << buffer;
         }
+        
         int ret_code = pclose(pipe);
         if (ret_code != 0) {
-            throw std::runtime_error("zstdcat command failed");
-        }
-
-        std::istringstream iss(file_content);
-        std::string line, header, sequence;
-        while (std::getline(iss, line)) {
-            if (!line.empty() && line[0] == '>') {
-                if (!header.empty() && !sequence.empty()) {
-                    // Check if header starts with the centroid_id
-                    if (header.substr(1, centroid_id.size()) == centroid_id) {
-                        std::cout << header << '\n' << sequence << '\n';
-                    }
-                }
-                header = line;
-                sequence.clear();
-            } else {
-                sequence += line;
-            }
-        }
-        // Check last sequence
-        if (!header.empty() && !sequence.empty()) {
-            // Check if header starts with the centroid_id
-            if (header.compare(1, centroid_id.size(), centroid_id) == 0) {
-                std::cout << header << '\n' << sequence << '\n';
-            }
+            throw std::runtime_error("Command failed");
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

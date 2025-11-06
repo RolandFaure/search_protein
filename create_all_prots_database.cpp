@@ -44,7 +44,6 @@ std::mutex& get_file_lock(const std::string& filename) {
 // prot_to_centroid_dict: unordered_map<string, string>
 void process_input_file_for_shard(
     const std::string& input_file,
-    int num_centroids_shards,
     int shard_idx,
     const std::unordered_map<std::string, std::string>& prot_to_centroid_dict,
     std::string tmp_dir)
@@ -82,8 +81,8 @@ void process_input_file_for_shard(
         auto it = prot_to_centroid_dict.find(last_dispatched_protein_id);
         if (it != prot_to_centroid_dict.end()) {
             const std::string& centroid = it->second;
-            int centroid_hash = simple_string_hash(centroid) % num_centroids_shards;
-            std::string output_file = tmp_dir + "centroid_" + std::to_string(centroid_hash) + ".fa";
+            auto centroid_hash = simple_string_hash(centroid);
+            std::string output_file = tmp_dir + "centroid_" + std::to_string(centroid_hash%10000) + "/"+std::to_string((centroid_hash / 10000) % 1000)+".fa";;
             std::ifstream out_handle(output_file);
             if (out_handle) {
                 std::string line;
@@ -104,8 +103,6 @@ void process_input_file_for_shard(
     std::ifstream fasta_handle(shard_file);
     if (!fasta_handle) return;
     std::string header_line;
-    std::unordered_map<std::string, std::vector<std::pair<std::string, std::string>>> buffer_map;
-
     while (std::getline(fasta_handle, header_line)) {
         if (header_line.empty() || header_line[0] != '>') continue;
         std::string protein_id = header_line.substr(1);
@@ -128,8 +125,14 @@ void process_input_file_for_shard(
         }
         else{
             const std::string& centroid = it->second;
-            int centroid_hash = simple_string_hash(centroid) % num_centroids_shards;
-            output_file = tmp_dir + "centroid_" + std::to_string(centroid_hash) + ".fa";
+            auto centroid_hash = simple_string_hash(centroid);
+            int dir_hash = centroid_hash % 10000;
+            int file_hash = (centroid_hash / 10000) % 1000;
+            std::string centroid_dir = tmp_dir + "centroid_" + std::to_string(dir_hash);
+            if (!fs::exists(centroid_dir)) {
+                fs::create_directories(centroid_dir);
+            }
+            output_file = centroid_dir + "/" + std::to_string(file_hash) + ".fa";
             number_of_dispatched_proteins += 1;
             new_desc = centroid + " " + header_line.substr(1);
         }
@@ -137,63 +140,23 @@ void process_input_file_for_shard(
         std::string sequence;
         std::getline(fasta_handle, sequence);
 
-        // Add to buffer
-        buffer_map[output_file].emplace_back(new_desc, sequence);
-
-        // Write to file if buffer size reaches 10000
-        if (buffer_map[output_file].size() >= 10000) {
-
-            int fd = open(output_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (fd == -1) {
-                std::cerr << "ERROR 450: Cannot open " << output_file << ": " << strerror(errno) << std::endl;
-                exit(1);
-            }
-
-            while (flock(fd, LOCK_EX) == -1) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-
-            std::string buffer_content;
-            for (const auto& entry : buffer_map[output_file]) {
-                buffer_content += ">" + entry.first + "\n" + entry.second + "\n";
-            }
-            write(fd, buffer_content.c_str(), buffer_content.size());
-
-            if (flock(fd, LOCK_UN) == -1) {
-                std::cerr << "ERROR: Failed to unlock file " << output_file << std::endl;
-                exit(1);
-            }
-            close(fd);
-
-            buffer_map[output_file].clear();
+        int fd = open(output_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd == -1) {
+            std::cerr << "ERROR 450: Cannot open " << output_file << ": " << strerror(errno) << std::endl;
+            exit(1);
         }
-    }
 
-    // Write remaining buffered lines
-    for (auto& [output_file, buffer] : buffer_map) {
-        if (!buffer.empty()) {
-
-            int fd = open(output_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (fd == -1) {
-                std::cerr << "ERROR 450: Cannot open " << output_file << ": " << strerror(errno) << std::endl;
-                exit(1);
-            }
-
-            while (flock(fd, LOCK_EX) == -1) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-
-            std::string buffer_content;
-            for (const auto& entry : buffer_map[output_file]) {
-                buffer_content += ">" + entry.first + "\n" + entry.second + "\n";
-            }
-            write(fd, buffer_content.c_str(), buffer_content.size());
-
-            if (flock(fd, LOCK_UN) == -1) {
-                std::cerr << "ERROR: Failed to unlock file " << output_file << std::endl;
-            }
-            close(fd);
+        while (flock(fd, LOCK_EX) == -1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+
+        std::string content = ">" + new_desc + "\n" + sequence + "\n";
+        write(fd, content.c_str(), content.size());
+
+        if (flock(fd, LOCK_UN) == -1) {
+            std::cerr << "ERROR: Failed to unlock file " << output_file << std::endl;
+        }
+        close(fd);
     }
 
     auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
@@ -213,7 +176,6 @@ void process_input_file_for_shard(
  * @param dict_centroids Path to the file containing centroid dictionary entries.
  * @param input_files Vector of input file paths to be processed for this shard.
  * @param num_threads Number of threads to use for parallel processing of input files.
- * @param num_centroids_shards Total number of centroid shards.
  * @param tmp_dir Temporary directory path for intermediate files.
  */
 void process_shard(
@@ -221,7 +183,6 @@ void process_shard(
     const std::string& dict_centroids,
     const std::vector<std::string>& input_files,
     int num_threads,
-    int num_centroids_shards,
     std::string tmp_dir)
 {
 
@@ -302,7 +263,6 @@ void process_shard(
             if (idx >= file_count) break;
             process_input_file_for_shard(
                 input_files[idx],
-                num_centroids_shards,
                 shard_idx,
                 prot_to_centroid_dict,
                 tmp_dir
@@ -334,14 +294,12 @@ int main(int argc, char* argv[]) {
 
     const int num_shards = 100;
     int num_threads = std::thread::hardware_concurrency()*2;
-    int num_centroids_shards = 10000;
     const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs";
     const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv";
     const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/";
 
     // const int num_shards = 100;
     // int num_threads = std::thread::hardware_concurrency()*2; //over-use the CPUs to exploit the fact that thread wait for I/O on disk
-    // int num_centroids_shards = 10000;
     // const std::string input_folder = "/pasteur/appa/scratch/rfaure/orfs";
     // const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv";
     // const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/";
@@ -349,7 +307,6 @@ int main(int argc, char* argv[]) {
     //// Test configuration for all_prots_test
     // const int num_shards = 2;
     // int num_threads = 10;
-    // int num_centroids_shards = 2;
     // const std::string file_centroids = "/pasteur/appa/scratch/rfaure/all_prots_test/centroids.fa";
     // const std::string input_folder = "/pasteur/appa/scratch/rfaure/all_prots_test";
     // const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/all_prots_test/centroid.tsv";
@@ -372,7 +329,7 @@ int main(int argc, char* argv[]) {
         std::cout << "  " << file << std::endl;
     }
 
-    process_shard(shard_idx, dict_centroids, input_files, num_threads, num_centroids_shards, tmp_dir);
+    process_shard(shard_idx, dict_centroids, input_files, num_threads, tmp_dir);
   
     cout << "FINISHED SHARD " << shard_idx << endl;
 
