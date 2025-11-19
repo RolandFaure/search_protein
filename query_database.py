@@ -284,8 +284,6 @@ def mmseqs2_results(results, query_fasta, output_format, output_file, num_thread
 
         print(f"Wrote {len(matched_records)} matched proteins to {matched_fasta}")
 
-
-
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Query a FAISS database with a sequence.")
