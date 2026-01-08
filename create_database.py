@@ -419,20 +419,26 @@ def create_faiss_database(input_fasta, database_folder, number_of_threads=1, siz
 
     empty_index_file = os.path.join(database_folder, "faiss_index_empty.bins")
     if not resume or not os.path.exists(empty_index_file):
-        if True : #test the flat index
-            print("WARNING: indexing using flat index to compare the results")
-            index = faiss.index_factory(d, "Flat" )
-        elif total_vectors < 50000000 :
+        # if True : #test the flat index
+        #     print("WARNING: indexing using flat index to compare the results")
+        #     index = faiss.index_factory(d, "Flat" )
+        if total_vectors < 0 :
             print("WARNING: indexing using HNSW because less than 5M vectors")
             index = faiss.index_factory(d, "HNSW,Flat" )
         else:
-            # Read the first 5M vectors and train the index
+            # Read the first 100M vectors and train the index
             with open(embedding_file, "rb") as ef:
-                training_data_bytes = ef.read(5000000 * bytes_per_vector)
+                training_data_bytes = ef.read(50_000_000 * bytes_per_vector)
                 training_data = np.frombuffer(training_data_bytes, dtype=np.float16).reshape(-1, d).astype(np.float32)
 
             # Initialize the FAISS index
-            index = faiss.index_factory(d, "OPQ64,IVF64k_HNSW,PQ64")
+            # index = faiss.index_factory(d, "OPQ64,IVF64k_HNSW,PQ64") #very small index but not so good recall
+            # index = faiss.index_factory(d, "IVF262144_HNSW32,SQ8")
+            # index = faiss.index_factory(d, "HNSW64,SQ8") #big index, good recall
+            index = faiss.index_factory(512, "SQ8")
+            # index = faiss.index_factory(512, "OPQ256,PQ256")
+
+
             if not index.is_trained:
                 index.train(training_data)
 
@@ -463,53 +469,85 @@ def create_faiss_database(input_fasta, database_folder, number_of_threads=1, siz
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compute embeddings for sequences in a FASTA file using gLM2 model, and index them in a FAISS database.")
-    parser.add_argument("input_fasta", type=str, help="Path to the input FASTA file.")
-    parser.add_argument("output_folder", type=str, help="Path to the output folder where embeddings will be saved.")
-    parser.add_argument("--chunk_size", type=int, default=1000000, help="Number of sequences per chunk (default: 100000).")
-    parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss database")
-    parser.add_argument("--num_gpus", type=int, default=0, help="Number of GPUs to use (default: all available).")
-    parser.add_argument("--num_cpus", type=int, default=1, help="Number of CPUs to use (default: 1).")
-    parser.add_argument("-F", "--force", action="store_true", help="Force overwrite of the output folder if it exists.")
-    parser.add_argument("--resume", action="store_true", help="Resume the embedding process if interrupted.")
+
+    parser = argparse.ArgumentParser(description="Tool to embed sequences with gLM2 and/or build a FAISS database.")
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
+    subparsers = parser.add_subparsers(dest='command', required=True)
+
+    # Embed subcommand
+    embed_parser = subparsers.add_parser('embed', help='Compute embeddings for sequences in a FASTA file.')
+    embed_parser.add_argument("input_fasta", type=str, help="Path to the input FASTA file.")
+    embed_parser.add_argument("output_folder", type=str, help="Path to the output folder where embeddings will be saved.")
+    embed_parser.add_argument("--chunk_size", type=int, default=1000000, help="Number of sequences per chunk (default: 1000000).")
+    embed_parser.add_argument("--num_gpus", type=int, default=0, help="Number of GPUs to use (default: all available).")
+    embed_parser.add_argument("--num_cpus", type=int, default=1, help="Number of CPUs to use for multiprocessing (default: 1).")
+    embed_parser.add_argument("-F", "--force", action="store_true", help="Force overwrite of the output folder if it exists.")
+    embed_parser.add_argument("--resume", action="store_true", help="Resume the embedding process if interrupted.")
+
+    # FAISS subcommand
+    faiss_parser = subparsers.add_parser('faiss', help='Create FAISS database from embeddings.')
+    faiss_parser.add_argument("input_fasta", type=str, help="Path to the input FASTA file (used for naming).")
+    faiss_parser.add_argument("database_folder", type=str, help="Path to the folder containing embeddings and where FAISS DB will be saved.")
+    faiss_parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss subdatabase (default: 10000000).")
+    faiss_parser.add_argument("--num_cpus", type=int, default=1, help="Number of CPU threads to use for building subdatabases (default: 1).")
+    faiss_parser.add_argument("-F", "--force", action="store_true", help="Force overwrite of database files if desired (not applied automatically).")
+    faiss_parser.add_argument("--resume", action="store_true", help="Resume the FAISS creation process if interrupted.")
 
     args = parser.parse_args()
-    print(f"Number of available GPUs: {torch.cuda.device_count()}")
 
-    if args.num_gpus == 0 :
-        args.num_gpus = torch.cuda.device_count()
+    # Print GPU info (useful for embed)
+    try:
+        print(f"Number of available GPUs: {torch.cuda.device_count()}")
+    except Exception:
+        print("Could not determine GPU count")
 
-    multiprocessing.set_start_method('spawn') #to work with CUDA
+    # Ensure multiprocessing start method for CUDA compatibility
+    try:
+        multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        # already set
+        pass
 
-    # if os.path.exists(args.output_folder):
-    #     if not args.force and not args.resume:
-    #         print(f"Output folder '{args.output_folder}' already exists. Use --force to overwrite.")
-    #         sys.exit(1)
-    #     elif not args.resume:
-    #         print("Warning: overwriting a previously existing database")
-    #         shutil.rmtree(args.output_folder)  
+    if args.command == "embed":
+        # determine GPUs count if 0 => use all
+        if args.num_gpus == 0:
+            args.num_gpus = torch.cuda.device_count()
 
-    if not args.resume or not os.path.exists(args.output_folder):
-        os.makedirs(args.output_folder)
+        # handle output folder existence
+        if os.path.exists(args.output_folder):
+            if not args.force and not args.resume:
+                print(f"Output folder '{args.output_folder}' already exists. Use --force to overwrite.")
+                sys.exit(1)
+            elif not args.resume:
+                print("Warning: overwriting a previously existing database")
+                shutil.rmtree(args.output_folder)
 
-    start_time_embeddings = time.time()
-    compute_all_embeddings_parallel(
-        input_fasta=args.input_fasta,
-        output_folder=args.output_folder,
-        size_of_chunk=args.chunk_size,
-        num_gpus=args.num_gpus,
-        resume=args.resume
-    )
-    end_time_embeddings = time.time()
-    print(f"Time taken to compute all embeddings: {end_time_embeddings - start_time_embeddings:.2f} seconds")
+        if not args.resume or not os.path.exists(args.output_folder):
+            os.makedirs(args.output_folder, exist_ok=True)
 
-    # start_time_faiss = time.time()
-    # create_faiss_database(args.input_fasta, database_folder=args.output_folder, number_of_threads=args.num_cpus, size_of_subdatabases=args.subdatabases_size, resume=args.resume)
-    # end_time_faiss = time.time()
-    # print(f"Time taken to create FAISS database: {end_time_faiss - start_time_faiss:.2f} seconds")
+        start_time_embeddings = time.time()
+        compute_all_embeddings_parallel(
+            input_fasta=args.input_fasta,
+            output_folder=args.output_folder,
+            size_of_chunk=args.chunk_size,
+            num_gpus=args.num_gpus,
+            resume=args.resume
+        )
+        end_time_embeddings = time.time()
+        print(f"Time taken to compute all embeddings: {end_time_embeddings - start_time_embeddings:.2f} seconds")
+        print("Embedding step done!")
 
-    print("All done!")
-
-
-
+    elif args.command == "faiss":
+        # call FAISS creation
+        # database_folder is the folder containing embeddings (output of embed) and where FAISS files will be written
+        start_time_faiss = time.time()
+        create_faiss_database(
+            input_fasta=args.input_fasta,
+            database_folder=args.database_folder,
+            number_of_threads=args.num_cpus,
+            size_of_subdatabases=args.subdatabases_size,
+            resume=args.resume
+        )
+        end_time_faiss = time.time()
+        print(f"Time taken to create FAISS database: {end_time_faiss - start_time_faiss:.2f} seconds")
+        print("FAISS database creation done!")

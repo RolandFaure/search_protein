@@ -31,7 +31,7 @@ int main(int argc, char* argv[]) {
 
     try {
         std::string filename = std::string(argv[1])+"/centroid_"+std::to_string(centroid_hash)+"/"+std::to_string((simple_string_hash(centroid_id)/10000)%1000)+".fa.zst";
-        std::string cmd = "zstdcat " + filename + " | grep -A1 '^>" + centroid_id + "'";
+        std::string cmd = "zstdcat " + filename + " | grep --no-group-separator -A1 '^>" + centroid_id + "'";
         
         FILE* pipe = popen(cmd.c_str(), "r");
         if (!pipe) {
@@ -45,7 +45,7 @@ int main(int argc, char* argv[]) {
         
         int ret_code = pclose(pipe);
         if (ret_code != 0) {
-            throw std::runtime_error("Command failed");
+            throw std::runtime_error("Command failed in centroid_to_prot: trying to do " + cmd);
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

@@ -6,7 +6,6 @@ namespace fs = std::filesystem;
 
 #include <fstream>
 #include <sstream>
-#include <cstring>
 #include <mutex>
 #include <map>
 #include <atomic>
@@ -14,13 +13,9 @@ namespace fs = std::filesystem;
 #include <thread>
 #include <future>
 #include <random>
-#include <sys/file.h>
-#include <unistd.h>
+#include <algorithm>
 
 using namespace::std;
-
-// Global file locks for thread safety
-std::map<std::string, std::mutex> file_locks;
 
 // simple string hash (explicitely code it so that we can easily export it to pyton)
 uint32_t simple_string_hash(const std::string& s) {
@@ -34,13 +29,6 @@ uint32_t simple_string_hash(const std::string& s) {
     return hash;
 }
 
-// Helper to get or create a lock for a file
-std::mutex& get_file_lock(const std::string& filename) {
-    static std::mutex global_mutex;
-    std::lock_guard<std::mutex> guard(global_mutex);
-    return file_locks[filename];
-}
-
 // prot_to_centroid_dict: unordered_map<string, string>
 void process_input_file_for_shard(
     const std::string& input_file,
@@ -50,61 +38,49 @@ void process_input_file_for_shard(
 {
     auto start_time = std::chrono::steady_clock::now();
     std::string base = fs::path(input_file).filename().string();
-    std::string shard_file = tmp_dir + base + "_shard_" + std::to_string(shard_idx) + ".fa";
+    std::string shard_file = tmp_dir + base.substr(0,base.size()-4) + "_shard_" + std::to_string(shard_idx) + ".fa.zst";
     if (!fs::exists(shard_file)) {
+        cout << "shard file "<< shard_file << " does not exist, return code 4510" << endl;
         return;
     }
 
-    //Let's find, for each file, what was the last dispatched protein of the file in the previous run
-    // Open the shard_file and get the last protein ID (header) that is in prot_to_centroid_dict
-    std::string last_dispatched_protein_id;
-    {
-        std::ifstream fasta_handle(shard_file);
-        std::string line;
-        while (std::getline(fasta_handle, line)) {
-            if (line.empty() || line[0] != '>') continue;
-            std::string protein_id = line.substr(1);
-            size_t space_pos = protein_id.find(' ');
-            if (space_pos != std::string::npos){
-                protein_id = protein_id.substr(0, space_pos);
-            }
-            if (prot_to_centroid_dict.find(protein_id) != prot_to_centroid_dict.end()) {
-                last_dispatched_protein_id = protein_id;
-            }
-            // Skip sequence line
-            std::getline(fasta_handle, line);
+    // Decompress the zstd file
+    std::string decompressed_file = shard_file + ".decompressed";
+    if (!fs::exists(decompressed_file)) {
+        std::string decompress_cmd = "zstd -d -c " + shard_file + " > " + decompressed_file;
+        int decompress_result = system(decompress_cmd.c_str());
+        if (decompress_result != 0) {
+            std::cerr << "ERROR: Failed to decompress " << shard_file << std::endl;
+            return;
         }
+    }
+    shard_file = decompressed_file;
+
+    // Create index file for this input file
+    std::string index_file = tmp_dir + "index_" + base.substr(0,base.size()-4) + "_shard_" + std::to_string(shard_idx) + ".bin";
+    std::ofstream index_out(index_file, std::ios::binary);
+    if (!index_out) {
+        std::cerr << "ERROR: Cannot create index file " << index_file << std::endl;
+        return;
     }
 
-    // Check if the last dispatched protein has already been dispatched
-    if (!last_dispatched_protein_id.empty()) {
-        auto it = prot_to_centroid_dict.find(last_dispatched_protein_id);
-        if (it != prot_to_centroid_dict.end()) {
-            const std::string& centroid = it->second;
-            auto centroid_hash = simple_string_hash(centroid);
-            std::string output_file = tmp_dir + "centroid_" + std::to_string(centroid_hash%10000) + "/"+std::to_string((centroid_hash / 10000) % 1000)+".fa";;
-            std::ifstream out_handle(output_file);
-            if (out_handle) {
-                std::string line;
-                std::string search_str = ">" + centroid + " " + last_dispatched_protein_id;
-                while (std::getline(out_handle, line)) {
-                    if (line.rfind(search_str, 0) == 0) {
-                        std::cout << "Last dispatched protein " << last_dispatched_protein_id << " already dispatched, skipping file " << shard_file << std::endl;
-                        return;
-                    }
-                }
-            }
-        }
-    }
+    std::string decompressed_file_with_centroid = shard_file + ".decompressed.centroid.fa";
+    std::ofstream fasta_out(decompressed_file_with_centroid);
 
     int number_of_missed_proteins = 0;
     int number_of_dispatched_proteins = 0;
 
     std::ifstream fasta_handle(shard_file);
     if (!fasta_handle) return;
+    
     std::string header_line;
-    while (std::getline(fasta_handle, header_line)) {
+    uint64_t centroid_file_offset = 0;
+    
+    while (fasta_handle.tellg() != -1) {
+        
+        if (!std::getline(fasta_handle, header_line)) break;
         if (header_line.empty() || header_line[0] != '>') continue;
+        
         std::string protein_id = header_line.substr(1);
         size_t space_pos = protein_id.find(' ');
         if (space_pos != std::string::npos){
@@ -112,56 +88,53 @@ void process_input_file_for_shard(
         }
 
         auto it = prot_to_centroid_dict.find(protein_id);
-        std::string output_file;
-        std::string new_desc;
         if (it == prot_to_centroid_dict.end()) {
             if (number_of_missed_proteins <= 10){
                 std::cerr << "ERROR 330: " << protein_id << " is not in shard " << shard_idx
                         << " but is found in " << shard_file << std::endl;
             }
-            output_file = tmp_dir + "centroid_unknown_" + std::to_string(shard_idx) + ".fa";
             number_of_missed_proteins += 1;
-            new_desc = "UNKNOWN_CENTROID "+ header_line.substr(1);
+
+            
+            // Skip sequence line
+            std::string sequence;
+            std::getline(fasta_handle, sequence);
         }
         else{
             const std::string& centroid = it->second;
             auto centroid_hash = simple_string_hash(centroid);
             int dir_hash = centroid_hash % 10000;
             int file_hash = (centroid_hash / 10000) % 1000;
-            std::string centroid_dir = tmp_dir + "centroid_" + std::to_string(dir_hash);
-            if (!fs::exists(centroid_dir)) {
-                fs::create_directories(centroid_dir);
-            }
-            output_file = centroid_dir + "/" + std::to_string(file_hash) + ".fa";
+            
+            // Write index entry: dir_hash (4 bytes), file_hash (4 bytes), offset in centroid file (8 bytes)
+            index_out.write(reinterpret_cast<const char*>(&dir_hash), sizeof(int));
+            index_out.write(reinterpret_cast<const char*>(&file_hash), sizeof(int));
+            index_out.write(reinterpret_cast<const char*>(&centroid_file_offset), sizeof(uint64_t));
+            
             number_of_dispatched_proteins += 1;
-            new_desc = centroid + " " + header_line.substr(1);
+            std::string new_header = ">" + centroid + "_" + header_line.substr(1) + "\n";
+            fasta_out << new_header;
+            centroid_file_offset += new_header.length();
+            
+            // Skip sequence line
+            std::string sequence;
+            std::getline(fasta_handle, sequence);
+            fasta_out << sequence << "\n";
+            centroid_file_offset += sequence.length() + 1;
         }
-
-        std::string sequence;
-        std::getline(fasta_handle, sequence);
-
-        int fd = open(output_file.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd == -1) {
-            std::cerr << "ERROR 450: Cannot open " << output_file << ": " << strerror(errno) << std::endl;
-            exit(1);
-        }
-
-        while (flock(fd, LOCK_EX) == -1) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-
-        std::string content = ">" + new_desc + "\n" + sequence + "\n";
-        write(fd, content.c_str(), content.size());
-
-        if (flock(fd, LOCK_UN) == -1) {
-            std::cerr << "ERROR: Failed to unlock file " << output_file << std::endl;
-        }
-        close(fd);
     }
 
+    // Replace the decompressed file with the centroid version
+    fasta_out.close();
+    fasta_handle.close();
+    std::remove(shard_file.c_str());
+    std::rename(decompressed_file_with_centroid.c_str(), shard_file.c_str());
+
+    index_out.close();
+
     auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
-    std::cout << "In shard " << shard_idx << ", just dispatched " << shard_file
-              << " in " << elapsed << " seconds. In total, dispatched " << number_of_dispatched_proteins << " and did not find " << number_of_missed_proteins << " proteins." << std::endl;
+    std::cout << "In shard " << shard_idx << ", just indexed " << shard_file << " to " << index_file
+              << " in " << elapsed << " seconds. In total, indexed " << number_of_dispatched_proteins << " and did not find " << number_of_missed_proteins << " proteins." << std::endl;
 }
 
 /**
@@ -234,7 +207,7 @@ void process_shard(
         std::string line;
         std::getline(dict_file, line);
         if (line.empty()) continue;
-        size_t tab_pos = line.find('\t');
+        size_t tab_pos = line.find(' '); //now it's space-separated, not tab_separated
         if (tab_pos == std::string::npos) continue;
         std::string centroid = line.substr(0, tab_pos);
         std::string protein = line.substr(tab_pos + 1);
@@ -275,6 +248,8 @@ void process_shard(
         threads.emplace_back(worker);
     }
     for (auto& t : threads) t.join();
+
+    std::cout << "Finished indexing for shard " << shard_idx << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -292,17 +267,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const int num_shards = 100;
-    int num_threads = std::thread::hardware_concurrency()*2;
-    const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs";
-    const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv";
-    const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/";
-
     // const int num_shards = 100;
-    // int num_threads = std::thread::hardware_concurrency()*2; //over-use the CPUs to exploit the fact that thread wait for I/O on disk
-    // const std::string input_folder = "/pasteur/appa/scratch/rfaure/orfs";
-    // const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete.tsv";
-    // const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/";
+    // int num_threads = std::max(1u, std::thread::hardware_concurrency() * 2);
+    // const std::string input_folder = "/pasteur/appa/scratch/rchikhi/logan_cluster/orfs";
+    // const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/human-complete.tsv";
+    // const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins_human/";
+
+    const int num_shards = 100;
+    int num_threads = 2; //over-use the CPUs to exploit the fact that thread wait for I/O on disk
+    const std::string input_folder = "/pasteur/appa/scratch/rfaure/orfs";
+    const std::string dict_centroids = "/pasteur/appa/scratch/rfaure/nonhuman-complete_tsv_sorted/nonhuman-complete.tsv";
+    const std::string output_dir = "/pasteur/appa/scratch/rfaure/all_prots/proteins3/";
+    std::string pattern = "nonhuman";
 
     //// Test configuration for all_prots_test
     // const int num_shards = 2;
@@ -318,8 +294,8 @@ int main(int argc, char* argv[]) {
     for (const auto& entry : fs::directory_iterator(input_folder)) {
         if (entry.is_regular_file()) {
             std::string filename = entry.path().filename().string();
-            if (filename.rfind("human", 0) == 0 && filename.size() >= 4 && filename.substr(filename.size() - 4) == ".zst") {
-                input_files.push_back(entry.path().string().substr(0, entry.path().string().size() - 4));
+            if (filename.rfind(pattern, 0) == 0 && filename.size() >= 4 && filename.substr(filename.size() - 4) == ".zst") {
+                input_files.push_back(entry.path().string());
             }
         }
     }
