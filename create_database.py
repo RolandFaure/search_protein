@@ -1,12 +1,10 @@
 import torch
 from transformers import AutoModel, AutoTokenizer, AutoModelForMaskedLM, T5Tokenizer, BertConfig
 from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
 import numpy as np
 import time
 import sys
 from sklearn.metrics.pairwise import cosine_similarity
-from matplotlib.lines import Line2D
 import random
 import argparse
 import os

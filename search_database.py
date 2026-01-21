@@ -219,7 +219,8 @@ def mmseqs2_results(results, query_fasta, output_format, output_file, num_thread
         query_fasta = os.path.join(tmpdir, "target.fasta")
         with open(query_fasta, "w") as qf:
             for name, seq in results:
-                qf.write(f">{"".join("_".join(name.split("_")[3:]).split())}\n{seq}\n")
+                processed_name = "".join("_".join(name.split("_")[3:]).split())
+                qf.write(f">{processed_name}\n{seq}\n")
 
         # Create MMseqs2 database
         db_mmseqs = os.path.join(tmpdir, "db_mmseqs")
@@ -426,9 +427,15 @@ if __name__ == "__main__":
             if '>' in seq:
                 print("WARNING: '>' found in sequence: ", seq)
             if len(name.split()[0].split("_")) < 4:  # that's because the human and nonhuman db are not exactly formatted the same way
-                fasta_file.write(f">{"".join(name.split()[1:])}#{name.split()[0][1:]}\n{seq}\n")
+                header_parts = ''.join(name.split()[1:])
+                accession = name.split()[0][1:]
+                fasta_file.write(f">{header_parts}#{accession}\n{seq}\n")
             else:
-                fasta_file.write(f">{"".join("_".join(name.split("_")[3:]).split())}#{"_".join(name.lstrip('>').split("_")[:3])}\n{seq}\n")
+                # Extract header and accession from the name
+                header_parts = "_".join(name.split("_")[3:])
+                header_clean = "".join(header_parts.split())
+                accession = "_".join(name.lstrip('>').split("_")[:3])
+                fasta_file.write(f">{header_clean}#{accession}\n{seq}\n")
 
     # Run MMseqs2 and write main output files to output folder root
     mmseqs2_output = os.path.join(output_folder, "matches.mmseqs2")

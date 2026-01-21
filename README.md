@@ -16,18 +16,27 @@ A fast protein sequence search tool using embedding-based similarity search with
 - PyTorch (with CUDA support for GPU acceleration)
 - FAISS
 - MMseqs2
+- Transformers
 - NumPy
 - scikit-learn
 
-```bash
-# Install MMseqs2
-conda install -c bioconda mmseqs2
+### Setup
 
-# Install Python dependencies
-pip install torch faiss-cpu numpy scikit-learn
-# Or for GPU support:
-pip install torch faiss-gpu numpy scikit-learn
+Create a conda environment with all dependencies:
+
+```bash
+# Create and activate environment
+conda create -n search_fasta create  -c pytorch -c nvidia -c conda-forge -c bioconda   python=3.10 mmseqs2 "pytorch>=2.5" pytorch-cuda=12.1   "faiss-cpu>=1.8" numpy scikit-learn transformers einops
+conda activate search_fasta
+
 ```
+
+Then download the repo
+```bash
+# Clone the repository
+git clone https://github.com/RolandFaure/search_protein.git
+```
+
 
 ## Quick Start
 
@@ -103,8 +112,6 @@ results_folder/
 python embed_query.py \
     --query_sequences my_proteins.fasta \
     --output search_results \
-    --batch_size 20 \
-    -r \
     -F
 
 # 2. Search the database
@@ -112,7 +119,6 @@ python search_database.py \
     --database /data/protein_database \
     --output search_results \
     --query_sequences my_proteins.fasta \
-    --cutoff 0.15 \
     -t 16
 
 # 3. View results
