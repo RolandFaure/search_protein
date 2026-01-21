@@ -112,6 +112,7 @@ results_folder/
 python embed_query.py \
     --query_sequences my_proteins.fasta \
     --output search_results \
+    --force_cpu \ 
     -F
 
 # 2. Search the database
@@ -127,16 +128,28 @@ less search_results/matches.mmseqs2
 
 ## Performance Tips
 
-1. **GPU Acceleration**: Use GPU for embedding (~1s / query, vs 120s / query on CPU)
+To give an order of magnitude, searching for one protein takes 9000 CPU.s on my setup. Here are a few 
+key performance points to understand.
+
+1. **Batching queries**: The time needed to search through the database is strongly sub-linear in number of queries.
+On my system, the performance went from 9000 CPU.s for one query and 12000 CPU.s for 2000 queries.
+
+2. **Parallel Search**: Use multiple processes for faster database search. 
+   The program is theoretically trivially parallel, but in my tests is actually limited by RAM bandwidth and hence
+   the speedup is sub-linear in the number of processes.
+   */!\ RAM consumption of ~25GB / process*
    ```bash
-   python embed_query.py --query_sequences queries.fasta --output results -F
-   # GPU will be used automatically if available
+   python search_database.py --database db --output results --query_sequences queries.fasta -t 10
    ```
 
-2. **Parallel Search**: Use multiple threads for faster database search. */!\ RAM consumption of 20GB / process*
+3. **GPU Acceleration**: Use GPU for embedding 
+    At embedding time, using GPU takes ~1s / query versus 120s / query on CPU.
+    Keep in mind that embedding time is not significant for few queries.
    ```bash
-   python search_database.py --database db --output results --query_sequences queries.fasta -t 32
+   python embed_query.py --query_sequences queries.fasta --output results -F
+   # GPU will be used automatically if available, use --force_cpu if you do not want
    ```
+
 
 ## Troubleshooting
 
