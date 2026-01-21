@@ -66,12 +66,34 @@ def parallel_query_bins(original_fasta, database_folder, query_embeddings, query
     #     res = query_bin(bin_file, original_fasta, faiss_database_folder, query_embeddings, query_names, subdatabase_size, cutoff)
     #     all_results += [res]
     # Ensure query_embeddings is a numpy array for pickling
+    # Process bin files in batches to avoid opening too many files at once
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(query_bin, bin_file, original_fasta, faiss_database_folder, query_embeddings, query_names, subdatabase_size, cutoff) for bin_file in bin_files
-        ]
-        for future in as_completed(futures):
-            all_results.extend(future.result())
+        # Submit only max_workers tasks at a time to limit concurrent file handles
+        futures = {}
+        bin_files_iter = iter(bin_files)
+        
+        # Submit initial batch
+        for _ in range(max_workers):
+            try:
+                bin_file = next(bin_files_iter)
+                future = executor.submit(query_bin, bin_file, original_fasta, faiss_database_folder, query_embeddings, query_names, subdatabase_size, cutoff)
+                futures[future] = bin_file
+            except StopIteration:
+                break
+        
+        # Process results and submit new tasks as they complete
+        while futures:
+            done, _ = as_completed(futures).__next__(), None
+            all_results.extend(done.result())
+            del futures[done]
+            
+            # Submit next task if available
+            try:
+                bin_file = next(bin_files_iter)
+                future = executor.submit(query_bin, bin_file, original_fasta, faiss_database_folder, query_embeddings, query_names, subdatabase_size, cutoff)
+                futures[future] = bin_file
+            except StopIteration:
+                pass
     return all_results
 
 def query_faiss_database(original_fasta, database_folder, query_sequences, query_names, cutoff=0.2, num_gpus=1, gpus_available=True, subdatabase_size=10000000, max_workers=4):

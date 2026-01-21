@@ -82,7 +82,7 @@ def embed_glm2_parallel(sequences_device_id):
         with torch.no_grad():
             attention_mask = encodings.attention_mask.bool().to(device) #this is very important to handle the padding correctly
             pooled_embeds = model(encodings.input_ids.to(device), attention_mask=attention_mask).pooler_output
-        print("Embedded ", min(seq_start + batch_size, len(sequences)), " sequences")
+        # print("Embedded ", min(seq_start + batch_size, len(sequences)), " sequences")
 
         embeddings = torch.cat((embeddings, pooled_embeds), dim=0)
 
@@ -435,7 +435,8 @@ def create_faiss_database(input_fasta, database_folder, number_of_threads=1, siz
             # index = faiss.index_factory(d, "OPQ64,IVF64k_HNSW,PQ64") #very small index but not so good recall
             # index = faiss.index_factory(d, "IVF262144_HNSW32,SQ8")
             # index = faiss.index_factory(d, "HNSW64,SQ8") #big index, good recall
-            index = faiss.index_factory(512, "SQ8")
+            # index = faiss.index_factory(512, "SQ8")
+            index = faiss.index_factory(d, "Flat" )
             # index = faiss.index_factory(512, "OPQ256,PQ256")
 
 
