@@ -157,6 +157,9 @@ On my system, the performance went from 9000 CPU.s for one query and 12000 CPU.s
 
 If you encounter out of memory errors during search, reduce the number of threads with `-t` (each process requires ~25GB of RAM)
 
+### Problem loading the model
+The script connects to the internet to load the gLM2 model the first time it runs. Make sure you have an internet connection.
+
 ## License
 
 This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See LICENSE file for details.
