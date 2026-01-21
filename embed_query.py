@@ -79,11 +79,13 @@ if __name__ == "__main__":
     parser.add_argument("--output", "-o", required=True, help="Path to output folder")
     parser.add_argument("-F", "--force", action="store_true", help="Force cleaning the output folder if it exists")
     parser.add_argument("--force_cpu", action="store_true", help="Force the use of CPU even if GPUs are available.")
-    parser.add_argument("--batch_size", type=int, default=10, help="Batch size for embedding.")
-    parser.add_argument("-r","--reduce_query", action="store_true", help="Cluster similar proteins to reduce embedding time (identity > 0.9)")
+    # parser.add_argument("--batch_size", type=int, default=10, help="Batch size for embedding.")
+    # parser.add_argument("-r","--reduce_query", action="store_true", help="Cluster similar proteins to reduce embedding time (identity > 0.9)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     
     args = parser.parse_args()
+    batch_size = 10
+    reduce_query = True
     
     # Handle output folder creation/cleanup
     output_folder = args.output.rstrip("/")
@@ -123,7 +125,7 @@ if __name__ == "__main__":
     sequence_now = ""
     query_file = args.query_sequences
 
-    if args.reduce_query:
+    if reduce_query:
             
         print("Clustering similar proteins with MMseqs2...")
         
@@ -175,7 +177,7 @@ if __name__ == "__main__":
     query_embeddings = embed_query_sequences(
         query_sequences=query_sequences,
         gpus_available=gpus_available,
-        batch_size=args.batch_size
+        batch_size=batch_size
     )
     
     # Save embeddings in intermediate_files

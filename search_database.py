@@ -311,13 +311,15 @@ if __name__ == "__main__":
     parser.add_argument("--query_sequences", required=True, help="Fasta file of queries (for MMseqs2 step)")
     parser.add_argument("--outfmt", type=str, default='0', help="Format of the output [1: SAM]")
     parser.add_argument("-t", "--num_threads", type=int, default=1, help="Number of threads to use for parallel querying.")
-    parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss database")
-    parser.add_argument("--cutoff", type=float, default=0.2, help="Distance cutoff for results")
-    parser.add_argument("-r","--reduce_embeddings", action="store_true", help="Cluster similar embeddings to reduce search time (cosine distance < 0.1)")
+    #parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss database")
+    #parser.add_argument("--cutoff", type=float, default=0.2, help="Distance cutoff for results")
+    #parser.add_argument("-r","--reduce_embeddings", action="store_true", help="Cluster similar embeddings to reduce search time")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
-    cutoff = args.cutoff
+    cutoff = 0.2
+    subdatabase_size = 10000000
+    reduce_embeddings = True
     group_distance = 0.2
     path_to_centroid_to_prots = os.path.join(os.path.dirname(__file__), "centroid_to_prots")
 
@@ -358,7 +360,7 @@ if __name__ == "__main__":
     print(f"Number of queries: {len(query_names)}")
 
     # Optionally reduce embeddings by clustering similar ones
-    if args.reduce_embeddings:
+    if reduce_embeddings:
         print("Reducing embeddings by clustering...")
         original_count = len(query_embeddings)
         query_embeddings = reduce_number_of_embeddings(query_embeddings, threshold=group_distance)
@@ -374,7 +376,7 @@ if __name__ == "__main__":
         query_embeddings=query_embeddings,
         query_names=query_names,
         cutoff=cutoff,
-        subdatabase_size=args.subdatabases_size,
+        subdatabase_size=subdatabase_size,
         max_workers=args.num_threads
     )
     t2 = time.time()
