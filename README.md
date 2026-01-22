@@ -1,4 +1,4 @@
-# search_fasta
+# search_protein
 
 A fast protein sequence search tool using embedding-based similarity search with FAISS.
 
