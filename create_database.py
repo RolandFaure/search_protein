@@ -36,8 +36,8 @@ def initialize_model_and_tokenizer(device_id):
     """
     device = torch.device(f'cuda:{device_id}' if (torch.cuda.is_available() and device_id != 'cpu') else 'cpu')
     
-    model = AutoModel.from_pretrained('tattabio/gLM2_650M_embed', torch_dtype=torch.bfloat16, trust_remote_code=True).to(device)
-    tokenizer = AutoTokenizer.from_pretrained('tattabio/gLM2_650M_embed', trust_remote_code=True)
+    model = AutoModel.from_pretrained('tattabio/gLM2_650M_embed', revision="1b5c96057abf48f85e460a5f9a69deadc820f51c", torch_dtype=torch.bfloat16, trust_remote_code=True).to(device)
+    tokenizer = AutoTokenizer.from_pretrained('tattabio/gLM2_650M_embed', revision="1b5c96057abf48f85e460a5f9a69deadc820f51c", trust_remote_code=True)
     
     return model, tokenizer
 
