@@ -146,7 +146,7 @@ def _process_centroid_result(args_tuple):
     centroid_id = centroid_name.strip().lstrip('>').split(' ')[0]
     # Use process ID instead of thread ID for better uniqueness
     tmp_filename = f"tmp_{os.getpid()}_{centroid_id}.fa"
-    command = f"{path_to_centroid_to_prots} {database_all_proteins} {centroid_id} | awk -F'>' '{{ if ($1==\"\") {{ if (NF>=3) print \">\"$2; else print $0 }} else {{ print $1 }} }}' > {tmp_filename}"
+    command = f"{path_to_centroid_to_prots} {database_all_proteins} {centroid_id} > {tmp_filename}"
     subprocess.run(command, shell=True, check=True)
     proteins = []
     with open(tmp_filename, "r") as tmp_file:
@@ -219,7 +219,11 @@ def mmseqs2_results(results, query_fasta, output_format, output_file, num_thread
         query_fasta = os.path.join(tmpdir, "target.fasta")
         with open(query_fasta, "w") as qf:
             for name, seq in results:
-                processed_name = "".join("_".join(name.split("_")[3:]).split())
+                #there are two different formats
+                if len("".join("_".join(name.split("_")[:3]).split())) < len(name.split(" ")[0]) :
+                    processed_name = "".join("_".join(name.split("_")[3:]).split())
+                else :
+                    processed_name = "".join(name.split(" ")[1:])
                 qf.write(f">{processed_name}\n{seq}\n")
 
         # Create MMseqs2 database
