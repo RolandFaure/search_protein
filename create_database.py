@@ -12,6 +12,7 @@ import fcntl
 import faiss
 import time
 import multiprocessing
+from usearch.index import Index
 from multiprocessing import Pool, Manager
 from functools import partial
 import shutil
@@ -375,19 +376,25 @@ def process_subdatabase(embedding_file, bytes_per_vector, database_folder, start
     local_index_db.add(local_vectors)
     print("Vectors added", flush=True)
 
-    # Lock the status file, checkflush=True status, and write the FAISS index atomically
+    index_file = os.path.join(database_folder, f"faiss_index_{subdatabase_id}.bin")
+    tmp_index_file = os.path.join(database_folder, f"faiss_index_{subdatabase_id}.{os.getpid()}.tmp")
+
+    # Save outside shared lock to avoid long lock holds.
+    faiss.write_index(local_index_db, tmp_index_file)
+
+    # Finalize atomically under lock.
     with open(file_already_done_subdatabase, "rb+") as sf:
         fcntl.flock(sf, fcntl.LOCK_EX)
         sf.seek(subdatabase_id)
         status = sf.read(1)
         if status == b'\x01':
-            print(f"Subdatabase {subdatabase_id} has already been processed. Exiting.")
             fcntl.flock(sf, fcntl.LOCK_UN)
+            if os.path.exists(tmp_index_file):
+                os.remove(tmp_index_file)
+            print(f"Subdatabase {subdatabase_id} has already been processed. Exiting.")
             return
 
-        # Save the FAISS index for this subdatabase while holding the lock
-        index_file = os.path.join(database_folder, f"faiss_index_{subdatabase_id}.bin")
-        faiss.write_index(local_index_db, index_file)
+        os.replace(tmp_index_file, index_file)
 
         # Mark this subdatabase as done (1) in the status file
         sf.seek(subdatabase_id)
@@ -466,6 +473,114 @@ def create_faiss_database(input_fasta, database_folder, number_of_threads=1, siz
     with Pool(processes=number_of_threads) as pool:
         pool.starmap(process_subdatabase, tasks)
 
+def process_subdatabase_usearch(embedding_file, bytes_per_vector, database_folder, start_index, end_index, subdatabase_id, file_already_done_subdatabase):
+    """
+    Process a subdatabase by reading vectors, training the USEARCH index, and saving it.
+    """
+
+    # Open the status file once in read/write mode and lock it
+    with open(file_already_done_subdatabase, "rb+") as sf:
+        fcntl.flock(sf, fcntl.LOCK_EX)
+        sf.seek(0)
+        status_list = list(sf.read())
+        status = status_list[subdatabase_id]
+        if status == 1:
+            print(f"Subdatabase {subdatabase_id} has already been processed. Skipping.")
+            fcntl.flock(sf, fcntl.LOCK_UN)
+            return
+        else:
+            # Mark as in progress (2) before starting processing
+            sf.seek(subdatabase_id)
+            sf.write(b'\x02')
+            sf.flush()
+        fcntl.flock(sf, fcntl.LOCK_UN)
+
+    local_vectors = np.empty((0, d), dtype=np.float32)
+    print("Loading vectors for database ", subdatabase_id, " going from ", start_index, " to ", end_index, flush=True)
+    with open(embedding_file, "rb") as ef:
+        ef.seek(start_index * bytes_per_vector)
+        bytes_data = ef.read((end_index - start_index) * bytes_per_vector)
+
+        # Convert the bytes data into vectors
+        num_vectors = len(bytes_data) // bytes_per_vector
+        bytes_read = bytes_data[:num_vectors * bytes_per_vector]
+        local_vectors = np.frombuffer(bytes_read, dtype=np.float16).reshape(-1, d).astype(np.float32)
+
+    #fill the index
+    print("Adding vectors for subdatabase ", subdatabase_id, flush=True)
+    index_db = Index(
+        ndim=d,
+        metric='cos',
+        expansion_add = 128,
+        expansion_search = 128
+    )
+    keys = np.arange(0, end_index-start_index)
+    index_db.add(vectors=local_vectors, keys=keys)
+    print("Vectors added for subdatabase ", subdatabase_id, flush=True)
+
+    index_file = os.path.join(database_folder, f"usearch_index_{subdatabase_id}.bin")
+    tmp_index_file = os.path.join(database_folder, f"usearch_index_{subdatabase_id}.{os.getpid()}.tmp")
+
+    # Save the USEARCH index outside the shared status lock to avoid blocking all workers.
+    index_db.save(tmp_index_file)
+
+    # Finalize atomically under lock: either keep existing file if already done, or publish this one.
+    with open(file_already_done_subdatabase, "rb+") as sf:
+        fcntl.flock(sf, fcntl.LOCK_EX)
+        sf.seek(subdatabase_id)
+        status = sf.read(1)
+        if status == b'\x01':
+            fcntl.flock(sf, fcntl.LOCK_UN)
+            if os.path.exists(tmp_index_file):
+                os.remove(tmp_index_file)
+            print(f"Subdatabase {subdatabase_id} has already been processed. Exiting.")
+            return
+
+        os.replace(tmp_index_file, index_file)
+
+        # Mark this subdatabase as done (1) in the status file
+        sf.seek(subdatabase_id)
+        sf.write(b'\x01')
+        sf.flush()
+        fcntl.flock(sf, fcntl.LOCK_UN)
+    print(f"Subdatabase {subdatabase_id} saved to {index_file}")
+
+def create_usearch_database(input_fasta, database_folder, number_of_threads=1, size_of_subdatabases=5000000, resume=False):
+
+    # Similar to create_faiss_database but using USEARCH instead of FAISS
+    
+    total_number_of_vectors = 0
+    initial_index_of_subdatabase = 0
+
+    embedding_file = os.path.join(database_folder, f"{os.path.basename(input_fasta)}.embeddings")
+    print("Reading from file:", embedding_file)
+    bytes_per_vector = d * 2  # Each float16 is 2 bytes
+    vectors = np.empty((0, d), dtype=np.float32)
+    # Determine the total number of vectors
+    with open(embedding_file, "rb") as ef:
+        ef.seek(0, os.SEEK_END)
+        total_vectors = ef.tell() // bytes_per_vector
+    print("number of vectors: ", total_vectors )
+
+    # Create tasks for each subdatabase
+    tasks = []
+    # Create a file to record which tasks (subdatabases) have already been done
+    subdb_status_file = os.path.join(database_folder, "subdatabase_usearch_already_done.txt")
+    num_subdbs = (total_vectors + size_of_subdatabases - 1) // size_of_subdatabases
+    subdb_done = [False for i in range(num_subdbs)]
+    if not os.path.exists(subdb_status_file) or not resume:
+        with open(subdb_status_file, "wb") as sf:
+            sf.write(b'\x00' * num_subdbs)
+
+    #index
+    for subdatabase_id, start_index in enumerate(range(0, total_vectors, size_of_subdatabases)):
+        end_index = min(start_index + size_of_subdatabases, total_vectors)
+        tasks.append((embedding_file, bytes_per_vector, database_folder, start_index, end_index, subdatabase_id, subdb_status_file))
+
+    # Process subdatabases in parallel
+    with Pool(processes=number_of_threads) as pool:
+        pool.starmap(process_subdatabase_usearch, tasks)
+
 
 if __name__ == "__main__":
 
@@ -491,6 +606,15 @@ if __name__ == "__main__":
     faiss_parser.add_argument("--num_cpus", type=int, default=1, help="Number of CPU threads to use for building subdatabases (default: 1).")
     faiss_parser.add_argument("-F", "--force", action="store_true", help="Force overwrite of database files if desired (not applied automatically).")
     faiss_parser.add_argument("--resume", action="store_true", help="Resume the FAISS creation process if interrupted.")
+
+    #USearch subcommand
+    usearch_parser = subparsers.add_parser('usearch', help='Create USEARCH database from embeddings.')
+    usearch_parser.add_argument("input_fasta", type=str, help="Path to the input FASTA file (used for naming).")
+    usearch_parser.add_argument("database_folder", type=str, help="Path to the folder containing embeddings and where USEARCH DB will be saved.")
+    usearch_parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each usearch subdatabase (default: 10000000).")
+    usearch_parser.add_argument("--num_cpus", type=int, default=1, help="Number of CPU threads to use for building subdatabases (default: 1).")
+    usearch_parser.add_argument("-F", "--force", action="store_true", help="Force overwrite of database files if desired (not applied automatically).")
+    usearch_parser.add_argument("--resume", action="store_true", help="Resume the USEARCH creation process if interrupted.")
 
     args = parser.parse_args()
 
@@ -550,3 +674,18 @@ if __name__ == "__main__":
         end_time_faiss = time.time()
         print(f"Time taken to create FAISS database: {end_time_faiss - start_time_faiss:.2f} seconds")
         print("FAISS database creation done!")
+
+    elif args.command == "usearch":
+        # call USEARCH creation
+        # database_folder is the folder containing embeddings (output of embed) and where USEARCH files will be written
+        start_time_usearch = time.time()
+        create_usearch_database(
+            input_fasta=args.input_fasta,
+            database_folder=args.database_folder,
+            number_of_threads=args.num_cpus,
+            size_of_subdatabases=args.subdatabases_size,
+            resume=args.resume
+        )
+        end_time_usearch = time.time()
+        print(f"Time taken to create USEARCH database: {end_time_usearch - start_time_usearch:.2f} seconds")
+        print("USEARCH database creation done!")
