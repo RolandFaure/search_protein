@@ -656,7 +656,7 @@ def process_subdatabase_usearch(embedding_file, bytes_per_vector, database_folde
         metric='cos',
         expansion_add = 128,
         expansion_search = 128,
-        dtype="i8"
+        # dtype="i8"
     )
     keys = np.arange(0, end_index-start_index)
     index_db.add(vectors=local_vectors, keys=keys)

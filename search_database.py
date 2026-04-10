@@ -15,7 +15,7 @@ import subprocess
 from sklearn.metrics.pairwise import cosine_distances
 from usearch.index import Index,search, MetricKind, BatchMatches
 
-__version__ = "1.4.0"
+__version__ = "2.1.0"
 
 def load_pca_if_exists(database_folder):
     """
@@ -551,6 +551,75 @@ def mmseqs2_results(results, query_fasta, output_format, output_file, num_thread
         print(f"Wrote {len(matched_records)} matched proteins to {matched_fasta}")
 
 
+def align_centroids_with_mmseqs2(unique_fasta, query_fasta, num_threads):
+    """
+    Align centroids FASTA file against query sequences using MMseqs2.
+    Returns the set of centroid IDs (headers) that have at least one match.
+    """
+    print("Aligning centroids against query using MMseqs2...")
+    
+    # Create a temporary directory to store MMseqs2 files
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Load query sequences
+        sequences = {}
+        with open(query_fasta, "r") as f:
+            name = None
+            seq = []
+            for line in f:
+                line = line.strip()
+                if line.startswith(">"):
+                    if name is not None:
+                        sequences[name] = "".join(seq)
+                    name = line
+                    seq = []
+                else:
+                    seq.append(line)
+            if name is not None:
+                sequences[name] = "".join(seq)
+
+        # Create MMseqs2 database for queries (the database to search against)
+        query_db_fasta = os.path.join(tmpdir, "query_db.fasta")
+        with open(query_db_fasta, "w") as f:
+            for name, seq in sequences.items():
+                f.write(f"{name}\n{seq}\n")
+
+        # Create MMseqs2 databases
+        centroid_mmseqs = os.path.join(tmpdir, "centroid_mmseqs")
+        query_mmseqs = os.path.join(tmpdir, "query_mmseqs")
+        result_mmseqs = os.path.join(tmpdir, "result_mmseqs")
+        tmp_mmseqs = os.path.join(tmpdir, "tmp_mmseqs")
+
+        subprocess.run(["mmseqs", "createdb", unique_fasta, centroid_mmseqs], check=True)
+        subprocess.run(["mmseqs", "createdb", query_db_fasta, query_mmseqs], check=True)
+
+        print("MMseqs2 databases created for centroid alignment")
+
+        # Run MMseqs2 search: search centroids against query sequences
+        subprocess.run([
+            "mmseqs", "search", centroid_mmseqs, query_mmseqs, result_mmseqs, tmp_mmseqs,
+            "--threads", str(num_threads)
+        ], check=True)
+
+        # Convert results to tabular format
+        result_tsv = os.path.join(tmpdir, "result.tsv")
+        subprocess.run([
+            "mmseqs", "convertalis", centroid_mmseqs, query_mmseqs, result_mmseqs, result_tsv,
+            "--format-mode", "0"
+        ], check=True)
+
+        # Parse results to get matched centroids (unique query identifiers)
+        matched_centroids = set()
+        with open(result_tsv, "r") as resf:
+            for line in resf:
+                fields = line.strip().split("\t")
+                if len(fields) > 0:
+                    centroid_id = fields[0]  # First column is the centroid ID
+                    matched_centroids.add(centroid_id)
+
+        print(f"Found {len(matched_centroids)} centroids with at least one alignment to query")
+        return matched_centroids
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Search a database (FAISS or Usearch) using pre-computed embeddings.")
     parser.add_argument("--database", required=True, help="Path to the folder containing database files.")
@@ -579,8 +648,8 @@ if __name__ == "__main__":
         args.align_threads = args.align_threads if args.align_threads is not None else 1
     cutoff = 0.2 #cosine distance cutoff
     subdatabase_size = 10000000
-    reduce_embeddings = True
-    # reduce_embeddings = False
+    # reduce_embeddings = True
+    reduce_embeddings = False
     # print("DEBUG: reduce_embeddings is set to ", reduce_embeddings )
     group_distance = 0 #when using 0.1, the papilloma query hit 10B proteins, which is too much
     path_to_centroid_to_prots = os.path.join(os.path.dirname(__file__), "centroid_to_prots")
@@ -589,7 +658,7 @@ if __name__ == "__main__":
     # Set up folder structure
     output_folder = args.output.rstrip("/")
     if not os.path.exists(output_folder):
-        print(f"Error: Output folder '{output_folder}' does not exist. Run embed_query.py first.")
+        print(f"Error: Output '{output_folder}' does not exist. Run embed_query.py first.")
         exit(1)
     
     intermediate_folder = os.path.join(output_folder, "intermediate_files")
@@ -714,39 +783,79 @@ if __name__ == "__main__":
             fasta_file.write(f"{centroid_name}\n{sequence}\n")
     print(f"Unique centroid FASTA file written: {unique_fasta}")
 
-    centroid_hits = list(set([x[1] for x in query_results]))
-    all_results = obtain_all_proteins(centroid_hits, database+"/all_prots", path_to_centroid_to_prots, args.index_threads)
+    # Align centroids against query using MMseqs2 to filter results
+    t_align_start = time.time()
+    matched_centroids = align_centroids_with_mmseqs2(unique_fasta, args.query_sequences, args.index_threads)
+    t_align_end = time.time()
+    print(f"Time for centroid alignment: {t_align_end - t_align_start:.2f} seconds")
+
+    # Filter query_results to keep only centroids that aligned with the query
+    # Extract centroid IDs from the matched set (handling '>' prefix and header parsing)
+    matched_centroid_ids = set()
+    for centroid_id in matched_centroids:
+        # Remove '>' if present and get the first word
+        clean_id = centroid_id.lstrip(">").split()[0]
+        matched_centroid_ids.add(clean_id)
+
+    filtered_query_results = []
+    for query_name, centroid_name, sequence, distance in query_results:
+        # Extract centroid ID from centroid_name for comparison
+        centroid_id = centroid_name.strip()[1:].split()[0]  # Remove '>' and take first word
+        if centroid_id in matched_centroid_ids:
+            filtered_query_results.append((query_name, centroid_name, sequence, distance))
+
+    print(f"Filtered results: {len(filtered_query_results)} results from {len(query_results)} (kept centroids alignable with query)")
+
+    # Output all query results as diversified_hits.tsv (main output file) - includes all centroids for user research
+    diversified_hits_file = os.path.join(output_folder, "diversified_hits.tsv")
+    with open(diversified_hits_file, "w") as tsvfile:
+        tsvfile.write("#query_name\tresult_name\tresult_sequences\tcosine_distance\n")
+        for query_name, centroid_name, sequence, distance in query_results:
+            tsvfile.write(f"{query_name.strip()}\t{centroid_name.strip()[1:].split()[0]}\t{sequence}\t{distance}\n")
+    print(f"Diversified hits TSV file written: {diversified_hits_file}")
+
     t3 = time.time()
 
-    # Write all results to intermediate_files
-    fasta_output = os.path.join(intermediate_folder, "all_results.fasta")
-    with open(fasta_output, "w") as fasta_file:
-        for name, seq in all_results:
-            if '>' in seq:
-                print("WARNING{db_name} found in sequence: ", seq)
-            if len(name.split()[0].split("_")) < 4:  # that's because the human and nonhuman db are not exactly formatted the same way
-                header_parts = ''.join(name.split()[1:])
-                accession = name.split()[0][1:]
-                fasta_file.write(f">{header_parts}#{accession}\n{seq}\n")
-            else:
-                # Extract header and accession from the name
-                header_parts = "_".join(name.split("_")[3:])
-                header_clean = "".join(header_parts.split())
-                accession = "_".join(name.lstrip('>').split("_")[:3])
-                fasta_file.write(f">{header_clean}#{accession}\n{seq}\n")
+    # Optionally continue with protein extraction and full alignment
+    if len(filtered_query_results) > 0:
+        centroid_hits = list(set([x[1] for x in filtered_query_results]))
+        all_results = obtain_all_proteins(centroid_hits, database+"/all_prots", path_to_centroid_to_prots, args.index_threads)
+        t4_start = time.time()
 
-    # Run MMseqs2 and write main output files to output folder root
-    mmseqs2_output = os.path.join(output_folder, "matches.mmseqs2")
-    mmseqs2_results(all_results, args.query_sequences, args.outfmt, mmseqs2_output, args.align_threads)
-    t4 = time.time()
+        # Write all results to intermediate_files
+        fasta_output = os.path.join(intermediate_folder, "all_results.fasta")
+        with open(fasta_output, "w") as fasta_file:
+            for name, seq in all_results:
+                if '>' in seq:
+                    print("WARNING{db_name} found in sequence: ", seq)
+                if len(name.split()[0].split("_")) < 4:  # that's because the human and nonhuman db are not exactly formatted the same way
+                    header_parts = ''.join(name.split()[1:])
+                    accession = name.split()[0][1:]
+                    fasta_file.write(f">{header_parts}#{accession}\n{seq}\n")
+                else:
+                    # Extract header and accession from the name
+                    header_parts = "_".join(name.split("_")[3:])
+                    header_clean = "".join(header_parts.split())
+                    accession = "_".join(name.lstrip('>').split("_")[:3])
+                    fasta_file.write(f">{header_clean}#{accession}\n{seq}\n")
 
-    # Create top hit file in intermediate_files
-    top_hit_file = os.path.join(intermediate_folder, "matches.top_hit")
-    command = f"awk '!seen[$1]++' {mmseqs2_output} > {top_hit_file}"  # to keep only the first hit
-    subprocess.run(command, shell=True, check=True)
+        # Run MMseqs2 and write main output files to output folder root
+        mmseqs2_output = os.path.join(output_folder, "matches.mmseqs2")
+        mmseqs2_results(all_results, args.query_sequences, args.outfmt, mmseqs2_output, args.align_threads)
+        t4 = time.time()
 
-    print(f"Time for querying FAISS database: {t2 - t1:.2f} seconds")
-    print(f"Time for obtaining all proteins: {t3 - t2:.2f} seconds")
-    print(f"Time for running MMseqs2: {t4 - t3:.2f} seconds")
+        # Create top hit file in intermediate_files
+        top_hit_file = os.path.join(intermediate_folder, "matches.top_hit")
+        command = f"awk '!seen[$1]++' {mmseqs2_output} > {top_hit_file}"  # to keep only the first hit
+        subprocess.run(command, shell=True, check=True)
+
+        print(f"Time for obtaining all proteins: {t4_start - t3:.2f} seconds")
+        print(f"Time for running MMseqs2: {t4 - t4_start:.2f} seconds")
+    else:
+        t4 = t3
+        print("No filtered results, skipping protein extraction and MMseqs2 alignment")
+
+    print(f"Time for querying {db_name} database: {t2 - t1:.2f} seconds")
+    print(f"Time for centroid alignment: {t_align_end - t_align_start:.2f} seconds")
     print(f"Total time: {t4 - t1:.2f} seconds")
     
