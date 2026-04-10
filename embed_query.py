@@ -85,7 +85,8 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     batch_size = 10
-    reduce_query = True
+    # reduce_query = True
+    reduce_query = False
     
     # Handle output folder creation/cleanup
     output_folder = args.output.rstrip("/")
