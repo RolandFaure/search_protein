@@ -15,7 +15,7 @@ import subprocess
 from sklearn.metrics.pairwise import cosine_distances
 from usearch.index import Index,search, MetricKind, BatchMatches
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 def load_pca_if_exists(database_folder):
     """
@@ -630,6 +630,7 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--num_threads", type=int, default=None, help="Number of threads for both index querying and alignment. If specified, overrides --index_threads and --align_threads.")
     parser.add_argument("--index_threads", type=int, default=None, help="Number of threads to use for index querying (FAISS/Usearch) and protein extraction. If not specified, defaults to --num_threads or 1.")
     parser.add_argument("--align_threads", type=int, default=None, help="Number of threads to use for MMseqs2 alignment. If not specified, defaults to --num_threads or 1.")
+    parser.add_argument("--deep-search", action="store_true", help="If enabled, extract proteins from all search results instead of only aligned centroids, then align everything with MMseqs2")
     #parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss database")
     #parser.add_argument("--cutoff", type=float, default=0.2, help="Distance cutoff for results")
     #parser.add_argument("-r","--reduce_embeddings", action="store_true", help="Cluster similar embeddings to reduce search time")
@@ -798,13 +799,20 @@ if __name__ == "__main__":
         matched_centroid_ids.add(clean_id)
 
     filtered_query_results = []
-    for query_name, centroid_name, sequence, distance in query_results:
-        # Extract centroid ID from centroid_name for comparison
-        centroid_id = centroid_name.strip()[1:].split()[0]  # Remove '>' and take first word
-        if centroid_id in matched_centroid_ids:
-            filtered_query_results.append((query_name, centroid_name, sequence, distance))
+    
+    if args.deep_search:
+        # Deep search: use all query results without alignment filtering
+        print("Using deep-search mode: extracting proteins from ALL search results (no alignment filtering)")
+        filtered_query_results = query_results
+    else:
+        # Normal mode: filter to only aligned centroids
+        for query_name, centroid_name, sequence, distance in query_results:
+            # Extract centroid ID from centroid_name for comparison
+            centroid_id = centroid_name.strip()[1:].split()[0]  # Remove '>' and take first word
+            if centroid_id in matched_centroid_ids:
+                filtered_query_results.append((query_name, centroid_name, sequence, distance))
 
-    print(f"Filtered results: {len(filtered_query_results)} results from {len(query_results)} (kept centroids alignable with query)")
+    print(f"Filtered results: {len(filtered_query_results)} results from {len(query_results)} (kept centroids alignable with query)" if not args.deep_search else f"Deep-search mode: processing all {len(filtered_query_results)} search results")
 
     # Output all query results as diversified_hits.tsv (main output file) - includes all centroids for user research
     diversified_hits_file = os.path.join(output_folder, "diversified_hits.tsv")

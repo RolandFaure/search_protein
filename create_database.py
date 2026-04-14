@@ -19,7 +19,7 @@ import shutil
 
 d = 512
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 def compute_and_save_pca(embedding_file, database_folder, n_components=64, n_samples=1000000):
     """
@@ -551,10 +551,27 @@ def create_faiss_database(input_fasta, database_folder, number_of_threads=1, siz
     pca_folder = os.path.join(database_folder, "pca")
     embedding_dimension = d
     if pca_components is not None and pca_components > 0:
-        print(f"Applying PCA with {pca_components} components...")
-        pca = compute_and_save_pca(embedding_file, database_folder, n_components=pca_components)
-        embedding_file = apply_pca_to_embeddings(embedding_file, database_folder, pca, pca_components)
-        embedding_dimension = pca_components
+        if resume:
+            # Check if PCA files already exist
+            pca_model_file = os.path.join(pca_folder, "pca_model.pkl")
+            pca_stats_file = os.path.join(pca_folder, "pca_stats.json")
+            transformed_embedding_file = os.path.join(database_folder, f"{os.path.basename(embedding_file)}.pca")
+            
+            if os.path.exists(pca_model_file) and os.path.exists(pca_stats_file) and os.path.exists(transformed_embedding_file):
+                print(f"PCA files found. Loading existing PCA model with {pca_components} components...")
+                pca, _ = load_pca(pca_folder)
+                embedding_file = transformed_embedding_file
+                embedding_dimension = pca_components
+            else:
+                print(f"PCA files not found. Computing PCA with {pca_components} components...")
+                pca = compute_and_save_pca(embedding_file, database_folder, n_components=pca_components)
+                embedding_file = apply_pca_to_embeddings(embedding_file, database_folder, pca, pca_components)
+                embedding_dimension = pca_components
+        else:
+            print(f"Applying PCA with {pca_components} components...")
+            pca = compute_and_save_pca(embedding_file, database_folder, n_components=pca_components)
+            embedding_file = apply_pca_to_embeddings(embedding_file, database_folder, pca, pca_components)
+            embedding_dimension = pca_components
     
     bytes_per_vector = embedding_dimension * 2  # Each float16 is 2 bytes
     vectors = np.empty((0, embedding_dimension), dtype=np.float32)
@@ -613,6 +630,9 @@ def create_faiss_database(input_fasta, database_folder, number_of_threads=1, siz
         end_index = min(start_index + size_of_subdatabases, total_vectors)
         tasks.append((embedding_file, bytes_per_vector, database_folder, start_index, end_index, subdatabase_id, subdb_status_file, embedding_dimension))
 
+    # Shuffle tasks for random processing order
+    random.shuffle(tasks)
+
     # Process subdatabases in parallel
     with Pool(processes=number_of_threads) as pool:
         pool.starmap(process_subdatabase, tasks)
@@ -656,7 +676,7 @@ def process_subdatabase_usearch(embedding_file, bytes_per_vector, database_folde
         metric='cos',
         expansion_add = 128,
         expansion_search = 128,
-        # dtype="i8"
+        dtype="i8"
     )
     keys = np.arange(0, end_index-start_index)
     index_db.add(vectors=local_vectors, keys=keys)
@@ -702,10 +722,28 @@ def create_usearch_database(input_fasta, database_folder, number_of_threads=1, s
     # Handle PCA if requested
     embedding_dimension = d
     if pca_components is not None and pca_components > 0:
-        print(f"Applying PCA with {pca_components} components for USEARCH...")
-        pca = compute_and_save_pca(embedding_file, database_folder, n_components=pca_components)
-        embedding_file = apply_pca_to_embeddings(embedding_file, database_folder, pca, pca_components)
-        embedding_dimension = pca_components
+        if resume:
+            # Check if PCA files already exist
+            pca_folder = os.path.join(database_folder, "pca")
+            pca_model_file = os.path.join(pca_folder, "pca_model.pkl")
+            pca_stats_file = os.path.join(pca_folder, "pca_stats.json")
+            transformed_embedding_file = os.path.join(database_folder, f"{os.path.basename(embedding_file)}.pca")
+            
+            if os.path.exists(pca_model_file) and os.path.exists(pca_stats_file) and os.path.exists(transformed_embedding_file):
+                print(f"PCA files found. Loading existing PCA model with {pca_components} components...")
+                pca, _ = load_pca(pca_folder)
+                embedding_file = transformed_embedding_file
+                embedding_dimension = pca_components
+            else:
+                print(f"PCA files not found. Computing PCA with {pca_components} components for USEARCH...")
+                pca = compute_and_save_pca(embedding_file, database_folder, n_components=pca_components)
+                embedding_file = apply_pca_to_embeddings(embedding_file, database_folder, pca, pca_components)
+                embedding_dimension = pca_components
+        else:
+            print(f"Applying PCA with {pca_components} components for USEARCH...")
+            pca = compute_and_save_pca(embedding_file, database_folder, n_components=pca_components)
+            embedding_file = apply_pca_to_embeddings(embedding_file, database_folder, pca, pca_components)
+            embedding_dimension = pca_components
     
     bytes_per_vector = embedding_dimension * 2  # Each float16 is 2 bytes
     vectors = np.empty((0, embedding_dimension), dtype=np.float32)
@@ -729,6 +767,9 @@ def create_usearch_database(input_fasta, database_folder, number_of_threads=1, s
     for subdatabase_id, start_index in enumerate(range(0, total_vectors, size_of_subdatabases)):
         end_index = min(start_index + size_of_subdatabases, total_vectors)
         tasks.append((embedding_file, bytes_per_vector, database_folder, start_index, end_index, subdatabase_id, subdb_status_file, embedding_dimension))
+
+    # Shuffle tasks for random processing order
+    random.shuffle(tasks)
 
     # Process subdatabases in parallel
     with Pool(processes=number_of_threads) as pool:
