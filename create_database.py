@@ -17,11 +17,12 @@ from multiprocessing import Pool, Manager
 from functools import partial
 import shutil
 
+
 d = 512
 
 __version__ = "2.0.1"
 
-def compute_and_save_pca(embedding_file, database_folder, n_components=64, n_samples=1000000):
+def compute_and_save_pca(embedding_file, database_folder, n_components=64, n_samples=10_000_000):
     """
     Load the first n_samples vectors from embeddings, fit PCA, and save it.
     
@@ -29,7 +30,7 @@ def compute_and_save_pca(embedding_file, database_folder, n_components=64, n_sam
         embedding_file (str): Path to the embeddings file.
         database_folder (str): Path to folder where PCA model and stats will be saved.
         n_components (int): Number of PCA components (default: 64).
-        n_samples (int): Number of vectors to use for PCA fitting (default: 1000000).
+        n_samples (int): Number of vectors to use for PCA fitting (default: 10_000_000).
     
     Returns:
         PCA model object
@@ -143,7 +144,11 @@ def apply_pca_to_embeddings(embedding_file, database_folder, pca, n_components):
                 
                 # Convert and transform
                 chunk = np.frombuffer(bytes_data, dtype=np.float16).reshape(-1, d).astype(np.float32)
-                transformed_chunk = pca.transform(chunk).astype(np.float16)
+                transformed_chunk = pca.transform(chunk).astype(np.float32)
+                # Normalize after PCA to preserve unit length property
+                norms = np.linalg.norm(transformed_chunk, axis=1, keepdims=True)
+                transformed_chunk = transformed_chunk / (norms + 1e-10)
+                transformed_chunk = transformed_chunk.astype(np.float16)
                 
                 # Write transformed chunk
                 tf.write(transformed_chunk.tobytes())
@@ -677,7 +682,7 @@ def process_subdatabase_usearch(embedding_file, bytes_per_vector, database_folde
         expansion_add = 128,
         expansion_search = 128,
         dtype="i8"
-    )
+        )
     keys = np.arange(0, end_index-start_index)
     index_db.add(vectors=local_vectors, keys=keys)
     print("Vectors added for subdatabase ", subdatabase_id, flush=True)
@@ -768,7 +773,7 @@ def create_usearch_database(input_fasta, database_folder, number_of_threads=1, s
         end_index = min(start_index + size_of_subdatabases, total_vectors)
         tasks.append((embedding_file, bytes_per_vector, database_folder, start_index, end_index, subdatabase_id, subdb_status_file, embedding_dimension))
 
-    # Shuffle tasks for random processing order
+    # Shuffle tasks for random processing orders
     random.shuffle(tasks)
 
     # Process subdatabases in parallel
@@ -820,10 +825,16 @@ if __name__ == "__main__":
     except Exception:
         print("Could not determine GPU count")
 
-    # Ensure multiprocessing start method for CUDA compatibility
+    # Set multiprocessing start method based on command
+    # - 'spawn' for GPU commands (embed): safer CUDA initialization
+    # - 'fork' for CPU commands (faiss, usearch): more efficient, no GPU context issues
     try:
-        multiprocessing.set_start_method('spawn')
-    except RuntimeError:
+        if args.command == "embed":
+            multiprocessing.set_start_method('spawn', force=True)
+        else:  # faiss or usearch
+            if sys.platform != 'win32':
+                multiprocessing.set_start_method('fork', force=True)
+    except RuntimeError as e:
         # already set
         pass
 

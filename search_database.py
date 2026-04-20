@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
-Search a FAISS database using pre-computed query embeddings.
+Search a FAISS/usearch database using pre-computed query embeddings.
 """
+import os
+#limit the number of threads used by FAISS and other libraries to avoid oversubscription when using ProcessPoolExecutor
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 
 import faiss
 import argparse
-import os
+import pickle
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
 import numpy as np
@@ -14,8 +22,10 @@ import tempfile
 import subprocess
 from sklearn.metrics.pairwise import cosine_distances
 from usearch.index import Index,search, MetricKind, BatchMatches
+import datetime
+import pca
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 def load_pca_if_exists(database_folder):
     """
@@ -52,50 +62,11 @@ def apply_pca_to_query(query_embeddings, pca):
         np.ndarray: Transformed embeddings (shape: [n_queries, n_components])
     """
     transformed = pca.transform(query_embeddings.astype(np.float32))
-    return transformed.astype(np.float32)
-
-def reduce_number_of_embeddings(query_embeddings, threshold):
-    """
-    Cluster embeddings using cosine distance and return representative embeddings.
-    All embeddings within a cluster have cosine distance < 0.1 from the representative.
-    Returns the representative embeddings and the maximum distance between any representative
-    and its clustered vectors.
-    """
-    
-    if len(query_embeddings) == 0:
-        return query_embeddings, 0.0
-    
-    # Normalize embeddings for cosine distance calculation
-    norms = np.linalg.norm(query_embeddings, axis=1, keepdims=True)
-    normalized_embeddings = query_embeddings / (norms + 1e-10)
-    
-    # Greedy clustering
-    representatives = []
-    representative_indices = []
-    clustered = np.zeros(len(query_embeddings), dtype=bool)
-    max_distance = 0.0
-    
-    for i in range(len(query_embeddings)):
-        if clustered[i]:
-            continue
-        
-        # This embedding becomes a representative
-        representatives.append(query_embeddings[i])
-        representative_indices.append(i)
-        clustered[i] = True
-        
-        # Find all unclustered embeddings within 0.1 cosine distance
-        distances = cosine_distances(normalized_embeddings[i:i+1], normalized_embeddings)[0]
-        within_threshold = (distances < threshold) & (~clustered)
-        
-        # Track maximum distance to any clustered vector
-        if np.any(within_threshold):
-            max_distance = max(max_distance, np.max(distances[within_threshold]))
-        
-        clustered[within_threshold] = True
-    
-    print(f"Reduced {len(query_embeddings)} embeddings to {len(representatives)} representatives (max distance: {max_distance:.4f})")
-    return np.array(representatives), max_distance
+    # Normalize after PCA to preserve unit length property
+    transformed = transformed.astype(np.float32)
+    norms = np.linalg.norm(transformed, axis=1, keepdims=True)
+    transformed = transformed / (norms + 1e-10)
+    return transformed
 
 def query_bin(bin_file, original_fasta, database_folder, query_embeddings, query_names, subdatabase_size, cutoff):
     start_time = time.time()
@@ -130,26 +101,7 @@ def query_bin(bin_file, original_fasta, database_folder, query_embeddings, query
                 fastafile.seek(position_name)
                 name_line = fastafile.readline().strip()
                 sequence_line = fastafile.readline().strip()
-                final_results.append((query_names[query_idx], name_line, sequence_line, result[1]))
-
-                # #debug: for each result, also get the embedding and actually compute the cosine distance to be more accurate (use the same way of computing it as in reduce_number_of_embeddings, so that the cutoff is consistent)
-                # embeddings_file.seek(512 * 2 * result[0])  # each embedding is 512 floats, each float is 2 bytes
-                # embedding_bytes = embeddings_file.read(512 * 2)
-                # embedding = np.frombuffer(embedding_bytes, dtype=np.float16)
-                # embedding = embedding.astype(np.float32)  # convert to float32 for distance calculation
-                # query_embedding = query_embeddings[query_idx].reshape(1, -1)
-                # embedding = embedding.reshape(1, -1)
-                # # Normalize both embeddings
-                # query_embedding_norm = np.linalg.norm(query_embedding)
-                # embedding_norm = np.linalg.norm(embedding)
-                # if embedding_norm > 0:
-                #     query_embedding = query_embedding / embedding_norm
-                #     embedding = embedding / embedding_norm
-                # # Compute cosine distance and L2 distance to check the correlation between them
-                # dot_product = np.dot(query_embedding, embedding.T)[0][0]
-                # cosine_distance = 1 - dot_product
-                # l2_distance = np.linalg.norm(query_embedding - embedding)
-                # print(f"Distance to centroid {name_line} for query {query_names[query_idx]}: {cosine_distance:.4f} (original distance: {result[1]:.4f}), L2 distance: {l2_distance:.4f}")
+                final_results.append((query_names[query_idx], name_line, sequence_line, result[1], int(result[0])))
 
     elapsed_time = time.time() - start_time
     print(f"Total matches for bin {bin_file}: {np.sum([len(result) for result in results])}")
@@ -216,11 +168,15 @@ def query_usearch_bin(bin_file, original_fasta, database_folder, query_embedding
     index.load(index_path) #without memory-mapping
     # index = Index.restore(index_path, view=True) #with memory-mapping
     
+    # # Load PCA model if it exists (needed for debug distance calculations)
+    # pca, _ = load_pca_if_exists("/pasteur/appa/scratch/rfaure/nonhuman_db_usearch_pca/")
+    # print("DEBUG osfuoiu")
+    
     # Search with increasing k until we get results beyond the cutoff
     nb_of_searches = 1
     all_matches = None
     while nb_of_searches <= 10:
-        k = 20 * 2 ** nb_of_searches
+        k = 2000 * 2 ** nb_of_searches
         # print("query embedding shape ", query_embeddings.shape, " searching with k=", k, " on index ", index_path)
         # query_embeddings = np.array([query_embeddings[0], query_embeddings[0]])
         matches : BatchMatches = index.search(query_embeddings, k, exact=False)
@@ -261,7 +217,7 @@ def query_usearch_bin(bin_file, original_fasta, database_folder, query_embedding
     results_sorted = [sorted(result, key=lambda x: x[1]) for result in results]
     final_results = []
     names_file = os.path.join(database_folder, f"{os.path.basename(original_fasta)}.names")
-    with open(names_file, "rb") as nf, open(original_fasta, "r") as fastafile, open("/pasteur/appa/scratch/rfaure/human_db_usearch/centroids.fa.embeddings", "rb") as embeddings_file:
+    with open(names_file, "rb") as nf, open(original_fasta, "r") as fastafile:
         for query_idx in range(len(results_sorted)):
             for result in results_sorted[query_idx]:
                 nf.seek(8 * int(result[0]))
@@ -269,47 +225,7 @@ def query_usearch_bin(bin_file, original_fasta, database_folder, query_embedding
                 fastafile.seek(position_name)
                 name_line = fastafile.readline().strip()
                 sequence_line = fastafile.readline().strip()
-                final_results.append((query_names[query_idx], name_line, sequence_line, result[1]))
-
-                # #load the actual 512-dimensional embeddings for the query (to debug)
-                # query_file = "/pasteur/appa/scratch/rfaure/queries/petases/output_human_one_petase/intermediate_files/query_embeddings.npy"
-                # query_embeddings_full = np.load(query_file)
-
-
-                # #now get the embedding and actually compute the cosine distance to be more accurate (use the same way of computing it as in reduce_number_of_embeddings, so that the cutoff is consistent)
-                # embeddings_file.seek(512 * 2 * int(result[0]))  # each embedding is 512 floats, each float is 2 bytes
-                # embedding_bytes = embeddings_file.read(512 * 2)
-                # embedding = np.frombuffer(embedding_bytes, dtype=np.float16)
-                # embedding = embedding.astype(np.float32)  # convert to float32 for distance calculation
-                # query_embedding = query_embeddings_full[query_idx].reshape(1, -1)
-                # embedding = embedding.reshape(1, -1)
-                # # Normalize both embeddings                query_embedding_norm = np.linalg.norm(query_embedding)
-                # embedding_norm = np.linalg.norm(embedding)
-                # if embedding_norm > 0:
-                #     query_embedding = query_embedding / embedding_norm
-                #     embedding = embedding / embedding_norm
-                # # Compute cosine distance
-                # dot_product = np.dot(query_embedding, embedding.T)[0][0]
-                # cosine_distance = 1 - dot_product
-
-                # # #compute the dot product half and quarter precision using only some dimensions, and output each distance
-                # # vector_half_precision = embedding[:, :256] / np.linalg.norm(embedding[:, :256])
-                # # vector_quarter_precision = embedding[:, :128] / np.linalg.norm(embedding[:, :128])
-                # # dot_product_half_precision = np.dot(query_embedding[:, :256]/np.linalg.norm(query_embedding[:, :256]), vector_half_precision.T)[0][0]
-                # # dot_product_quarter_precision = np.dot(query_embedding[:, :128]/np.linalg.norm(query_embedding[:, :128]), vector_quarter_precision.T)[0][0]
-                # # cosine_distance_half_precision = 1 - dot_product_half_precision
-                # # cosine_distance_quarter_precision = 1 - dot_product_quarter_precision
-                
-                # print("True distance vs returned distances:", cosine_distance, result[1])
-                # # print("distances: ", cosine_distance, cosine_distance_half_precision, cosine_distance_quarter_precision)
-                # # print(f"Distance to centroid {name_line} for query {query_names[query_idx]}: {cosine_distance:.4f} (original distance: {result[1]:.4f})")
-                # # print(f"Distance to centroid {name_line} for query {query_names[query_idx]} (half precision): {cosine_distance_half_precision:.4f}")
-                # # print(f"Distance to centroid {name_line} for query {query_names[query_idx]} (quarter precision): {cosine_distance_quarter_precision:.4f}")
-                # # #grep the name in /pasteur/appa/scratch/rfaure/queries/petases/output_human_one_petase/intermediate_files/query_results_intermediate.fasta and exit if it is not found, to check that we are actually looking at the same results
-                # # with open("/pasteur/appa/scratch/rfaure/queries/petases/output_human_one_petase/intermediate_files/query_results_intermediate.fasta", "r") as intermediate_fasta:
-                # #     if os.system(f"grep '{name_line}' /pasteur/appa/scratch/rfaure/queries/petases/output_human_one_petase/intermediate_files/query_results_intermediate.fasta > /dev/null") != 0:
-                # #         print(f"ERROR: {name_line} not found in intermediate FASTA, something is wrong!")
-                # #         sys.exit(1)
+                final_results.append((query_names[query_idx], name_line, sequence_line, result[1], int(result[0])))
 
     elapsed_time = time.time() - start_time
     print(f"Time taken for querying bin {bin_file}: {elapsed_time:.2f} seconds, time for post-processing: {time.time() - time_usearch:.2f} seconds")
@@ -320,6 +236,8 @@ def parallel_query_usearch_bins(original_fasta, database_folder, query_embedding
     """Query multiple usearch index files in parallel."""
     usearch_database_folder = database_folder + "/usearch"
     bin_files = [file for file in os.listdir(usearch_database_folder) if file.endswith(".bin")]
+    # bin_files = bin_files[:100] # DEBUG - limit to first 10 bins for testing
+    # print("DEBUUUUUGUGkkk")
 
     all_results = []
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -362,6 +280,100 @@ def search_usearch_database(original_fasta, database_folder, query_embeddings, q
     )
 
     return results
+
+
+def _load_embeddings_chunk(args_tuple):
+    """
+    Worker function to load a chunk of embeddings from disk.
+    """
+    embeddings_file_path, chunk_idxs = args_tuple
+    
+    chunk_embeddings = np.zeros((len(chunk_idxs), 512), dtype=np.float32)
+    
+    with open(embeddings_file_path, "rb") as embeddings_file:
+        for i, c_idx in enumerate(chunk_idxs):
+            embeddings_file.seek(512 * 2 * c_idx)
+            embedding_bytes = embeddings_file.read(512 * 2)
+            chunk_embeddings[i] = np.frombuffer(embedding_bytes, dtype=np.float16).astype(np.float32)
+            
+    return chunk_embeddings
+
+def filter_pca_hits(query_embeddings_full, query_names, query_results, embeddings_file_path, cutoff, max_workers=4):
+    """
+    Filter hits returned by the PCA index by recalculating true Cosine distance 
+    on the full 512-dimension vectors.
+    """
+    print("Filtering PCA hits using full 512-dimension embeddings to remove false positives...")
+    
+    if len(query_results) == 0:
+        return query_results
+        
+    if not os.path.exists(embeddings_file_path):
+        print(f"Warning: embeddings file not found at {embeddings_file_path}, skipping filtering.")
+        return [res[:4] for res in query_results]
+
+    time_start = time.time()
+
+    # Normalize query embeddings
+    norms = np.linalg.norm(query_embeddings_full, axis=1, keepdims=True)
+    query_embeddings_full = query_embeddings_full / (norms + 1e-10)
+    
+    # Map query names to their index
+    query_name_to_idx = {name: i for i, name in enumerate(query_names)}
+    
+    # Collect unique centroid indices to read to avoid duplicate reads
+    unique_c_idxs = sorted(list(set([res[4] for res in query_results])))
+    c_idx_to_matrix_idx = {c_idx: i for i, c_idx in enumerate(unique_c_idxs)}
+    
+    print(f"Loading {len(unique_c_idxs)} unique 512-dimension vectors across {max_workers} processes...")
+    
+    # Split the unique indices into chunks for multiprocessing
+    chunk_size = max(1, len(unique_c_idxs) // max_workers)
+    chunks = [unique_c_idxs[i:i + chunk_size] for i in range(0, len(unique_c_idxs), chunk_size)]
+    
+    # Prepare arguments for multiprocessing
+    args_list = [(embeddings_file_path, chunk) for chunk in chunks]
+    
+    db_embeddings_list = []
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_load_embeddings_chunk, args): i for i, args in enumerate(args_list)}
+        
+        results = [None] * len(chunks)
+        completed = 0
+        for future in as_completed(futures):
+            chunk_index = futures[future]
+            results[chunk_index] = future.result()
+            completed += 1
+            print(f"Loaded {completed}/{len(chunks)} chunks for PCA filtering...", end="\r")
+            
+    print() # clear the carriage return
+    
+    # Concatenate all chunks sequentially
+    db_embeddings = np.concatenate(results, axis=0)
+            
+    # Normalize DB embeddings matrix using vectorized operations
+    norms_db = np.linalg.norm(db_embeddings, axis=1, keepdims=True)
+    db_embeddings = db_embeddings / (norms_db + 1e-10)
+    
+    # Prepare indices for fast vectorized distance computation
+    q_indices = np.array([query_name_to_idx[res[0]] for res in query_results])
+    v_indices = np.array([c_idx_to_matrix_idx[res[4]] for res in query_results])
+    
+    Q_sub = query_embeddings_full[q_indices]
+    V_sub = db_embeddings[v_indices]
+    
+    # Fast element-wise multiplication and sum across dimensions is mathematically exactly dot products matching Q_sub and V_sub
+    dot_products = np.sum(Q_sub * V_sub, axis=1)
+    cosine_distances = 1.0 - dot_products
+    
+    filtered_results = []
+    for i, cosine_distance in enumerate(cosine_distances):
+        if cosine_distance < cutoff:
+            q_name, c_name, seq, pca_dist, c_idx = query_results[i]
+            filtered_results.append((q_name, c_name, seq, cosine_distance))
+
+    print(f"Filtered results from {len(query_results)} to {len(filtered_results)} valid hits in {time.time() - time_start:.2f} seconds.")
+    return filtered_results
 
 
 def _process_centroid_result(args_tuple):
@@ -427,7 +439,7 @@ def obtain_all_proteins(centroids, database_all_proteins, path_to_centroid_to_pr
     return all_results
 
 
-def mmseqs2_results(results, query_fasta, output_format, output_file, num_threads):
+def mmseqs2_results(results, query_fasta, output_format, output_file, num_threads, intermediate_folder=None):
     """
     Run MMseqs2 search instead of BLAST for the given results.
     """
@@ -474,23 +486,32 @@ def mmseqs2_results(results, query_fasta, output_format, output_file, num_thread
         result_mmseqs = os.path.join(tmpdir, "result_mmseqs")
         tmp_mmseqs = os.path.join(tmpdir, "tmp_mmseqs")
 
-        subprocess.run(["mmseqs", "createdb", db_fasta, db_mmseqs], check=True)
-        subprocess.run(["mmseqs", "createdb", query_fasta, query_mmseqs], check=True)
+        # Set up log files for mmseqs2 output
+        log_file_1 = os.path.join(intermediate_folder, "mmseqs_createdb_1.log") if intermediate_folder else os.devnull
+        log_file_2 = os.path.join(intermediate_folder, "mmseqs_createdb_2.log") if intermediate_folder else os.devnull
+        log_file_search = os.path.join(intermediate_folder, "mmseqs_search.log") if intermediate_folder else os.devnull
+        log_file_convertalis = os.path.join(intermediate_folder, "mmseqs_convertalis.log") if intermediate_folder else os.devnull
+        
+        with open(log_file_1, "w") as lf1, open(log_file_2, "w") as lf2, open(log_file_search, "w") as lfs, open(log_file_convertalis, "w") as lfc:
+            subprocess.run(["mmseqs", "createdb", db_fasta, db_mmseqs], check=True, stdout=lf1, stderr=subprocess.STDOUT)
+            subprocess.run(["mmseqs", "createdb", query_fasta, query_mmseqs], check=True, stdout=lf2, stderr=subprocess.STDOUT)
 
         print("mmseq created databases ")
 
         # Run MMseqs2 search
-        subprocess.run([
-            "mmseqs", "search", query_mmseqs, db_mmseqs, result_mmseqs, tmp_mmseqs,
-            "--threads", str(num_threads)
-        ], check=True)
+        with open(log_file_search, "w") as lfs:
+            subprocess.run([
+                "mmseqs", "search", query_mmseqs, db_mmseqs, result_mmseqs, tmp_mmseqs,
+                "--threads", str(num_threads)
+            ], check=True, stdout=lfs, stderr=subprocess.STDOUT)
 
         # Convert results to tabular format
         result_tsv = os.path.join(tmpdir, "result.tsv")
-        subprocess.run([
-            "mmseqs", "convertalis", query_mmseqs, db_mmseqs, result_mmseqs, result_tsv,
-            "--format-mode", output_format
-        ], check=True)
+        with open(log_file_convertalis, "w") as lfc:
+            subprocess.run([
+                "mmseqs", "convertalis", query_mmseqs, db_mmseqs, result_mmseqs, result_tsv,
+                "--format-mode", output_format
+            ], check=True, stdout=lfc, stderr=subprocess.STDOUT)
 
         # Output results
         with open(result_tsv, "r") as resf:
@@ -551,7 +572,7 @@ def mmseqs2_results(results, query_fasta, output_format, output_file, num_thread
         print(f"Wrote {len(matched_records)} matched proteins to {matched_fasta}")
 
 
-def align_centroids_with_mmseqs2(unique_fasta, query_fasta, num_threads):
+def align_centroids_with_mmseqs2(unique_fasta, query_fasta, num_threads, intermediate_folder=None):
     """
     Align centroids FASTA file against query sequences using MMseqs2.
     Returns the set of centroid IDs (headers) that have at least one match.
@@ -589,23 +610,32 @@ def align_centroids_with_mmseqs2(unique_fasta, query_fasta, num_threads):
         result_mmseqs = os.path.join(tmpdir, "result_mmseqs")
         tmp_mmseqs = os.path.join(tmpdir, "tmp_mmseqs")
 
-        subprocess.run(["mmseqs", "createdb", unique_fasta, centroid_mmseqs], check=True)
-        subprocess.run(["mmseqs", "createdb", query_db_fasta, query_mmseqs], check=True)
+        # Set up log files for mmseqs2 output
+        log_file_1 = os.path.join(intermediate_folder, "mmseqs_centroid_createdb_1.log") if intermediate_folder else os.devnull
+        log_file_2 = os.path.join(intermediate_folder, "mmseqs_centroid_createdb_2.log") if intermediate_folder else os.devnull
+        log_file_search = os.path.join(intermediate_folder, "mmseqs_centroid_search.log") if intermediate_folder else os.devnull
+        log_file_convertalis = os.path.join(intermediate_folder, "mmseqs_centroid_convertalis.log") if intermediate_folder else os.devnull
+        
+        with open(log_file_1, "w") as lf1, open(log_file_2, "w") as lf2, open(log_file_search, "w") as lfs, open(log_file_convertalis, "w") as lfc:
+            subprocess.run(["mmseqs", "createdb", unique_fasta, centroid_mmseqs], check=True, stdout=lf1, stderr=subprocess.STDOUT)
+            subprocess.run(["mmseqs", "createdb", query_db_fasta, query_mmseqs], check=True, stdout=lf2, stderr=subprocess.STDOUT)
 
         print("MMseqs2 databases created for centroid alignment")
 
         # Run MMseqs2 search: search centroids against query sequences
-        subprocess.run([
-            "mmseqs", "search", centroid_mmseqs, query_mmseqs, result_mmseqs, tmp_mmseqs,
-            "--threads", str(num_threads)
-        ], check=True)
+        with open(log_file_search, "w") as lfs:
+            subprocess.run([
+                "mmseqs", "search", centroid_mmseqs, query_mmseqs, result_mmseqs, tmp_mmseqs,
+                "--threads", str(num_threads)
+            ], check=True, stdout=lfs, stderr=subprocess.STDOUT)
 
-        # Convert results to tabular format
+        # Convert results to tabular formatG
         result_tsv = os.path.join(tmpdir, "result.tsv")
-        subprocess.run([
-            "mmseqs", "convertalis", centroid_mmseqs, query_mmseqs, result_mmseqs, result_tsv,
-            "--format-mode", "0"
-        ], check=True)
+        with open(log_file_convertalis, "w") as lfc:
+            subprocess.run([
+                "mmseqs", "convertalis", centroid_mmseqs, query_mmseqs, result_mmseqs, result_tsv,
+                "--format-mode", "0"
+            ], check=True, stdout=lfc, stderr=subprocess.STDOUT)
 
         # Parse results to get matched centroids (unique query identifiers)
         matched_centroids = set()
@@ -620,52 +650,194 @@ def align_centroids_with_mmseqs2(unique_fasta, query_fasta, num_threads):
         return matched_centroids
 
 
+def calculate_index_threads(database_folder, db_type, max_threads, max_memory_gb):
+    """
+    Calculate the number of threads to use for index querying based on available memory.
+    
+    Strategy:
+    - Look at the *_0.bin file size in the database
+    - Estimate RAM needed per thread as: bin_file_size * 2
+    - Deduce how many threads can run based on max_memory_gb
+    - Return min(calculated_threads, max_threads)
+    
+    Args:
+        database_folder (str): Path to the database folder
+        db_type (str): 'faiss' or 'usearch'
+        max_threads (int): Maximum number of threads available
+        max_memory_gb (float): Maximum memory available in GB
+    
+    Returns:
+        int: Number of threads to use for index querying
+    """
+    # Determine the correct subdirectory
+    if db_type == 'usearch':
+        index_dir = os.path.join(database_folder, "usearch")
+    else:
+        index_dir = os.path.join(database_folder, "faiss")
+    
+    # Find the _0.bin file
+    bin_files = [f for f in os.listdir(index_dir) if f.endswith("_0.bin")]
+    
+    if not bin_files:
+        print(f"Warning: No *_0.bin file found in {index_dir}. Defaulting to 1 thread for index querying.")
+        return 1
+    
+    bin_path = os.path.join(index_dir, bin_files[0])
+    bin_size_bytes = os.path.getsize(bin_path)
+    bin_size_gb = bin_size_bytes / (1024 ** 3)
+    
+    # RAM needed per thread is approximately: bin_size * 2
+    ram_per_thread_gb = bin_size_gb * 2
+    
+    if ram_per_thread_gb <= 0:
+        print("Warning: Bin file is empty or too small. Defaulting to 1 thread.")
+        return 1
+    
+    # Calculate how many threads we can run with available memory
+    threads_by_memory = int(max_memory_gb / ram_per_thread_gb)
+    
+    # Use the minimum of threads limited by memory or max_threads
+    index_threads = max(1, min(threads_by_memory, max_threads))
+    
+    print(f"Using {index_threads} threads for index querying based on the available memory and bin file size.")
+    
+    return index_threads
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Search a database (FAISS or Usearch) using pre-computed embeddings.")
+    parser = argparse.ArgumentParser(description="Search a database (FAISS or Usearch) using pre-computed embeddings. Can optionally embed query sequences on-the-fly.")
+    parser.add_argument("--query_sequences", required=True, help="Fasta file of queries")
     parser.add_argument("--database", required=True, help="Path to the folder containing database files.")
-    parser.add_argument("--output", "-o", required=True, help="Path to the output folder (created by embed_query.py)")
-    parser.add_argument("--query_sequences", required=True, help="Fasta file of queries (for MMseqs2 step)")
+    parser.add_argument("--output", "-o", required=True, help="Path to the output folder (created by embed_query.py if embedding step was run separately).")
     parser.add_argument("--db-type", type=str, choices=['faiss', 'usearch'], default='faiss', help="Database type to use: faiss or usearch (default: faiss)")
-    parser.add_argument("--outfmt", type=str, default='0', help="Format of the output [1: SAM]")
-    parser.add_argument("-t", "--num_threads", type=int, default=None, help="Number of threads for both index querying and alignment. If specified, overrides --index_threads and --align_threads.")
-    parser.add_argument("--index_threads", type=int, default=None, help="Number of threads to use for index querying (FAISS/Usearch) and protein extraction. If not specified, defaults to --num_threads or 1.")
-    parser.add_argument("--align_threads", type=int, default=None, help="Number of threads to use for MMseqs2 alignment. If not specified, defaults to --num_threads or 1.")
+    parser.add_argument("--outfmt", type=str, default='0', help="Format of the mmseqs2 output [0], default is 0 which is a tabular format with header. See mmseqs2 documentation for details.")
+    parser.add_argument("-m", "--memory", type=float, required=True, help="Maximum memory available in GB (mandatory)")
+    parser.add_argument("-t", "--num_threads", type=int, required=True, help="Maximum number of threads available (mandatory)")
+    parser.add_argument("--force_cpu", action="store_true", help="Force the use of CPU even if GPUs are available (for embedding step).")
     parser.add_argument("--deep-search", action="store_true", help="If enabled, extract proteins from all search results instead of only aligned centroids, then align everything with MMseqs2")
     #parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss database")
     #parser.add_argument("--cutoff", type=float, default=0.2, help="Distance cutoff for results")
-    #parser.add_argument("-r","--reduce_embeddings", action="store_true", help="Cluster similar embeddings to reduce search time")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
+
+    print(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    print("search_database.py version ", __version__)
+    print("command line used:\n", " ".join(sys.argv))
     
-    # Handle thread arguments: allow --num_threads to override both, or set them independently
-    if args.num_threads is not None:
-        # If --num_threads is specified, use it for both
-        args.index_threads = args.num_threads
-        args.align_threads = args.num_threads
-    else:
-        # Otherwise use the specific arguments or default to 1
-        args.index_threads = args.index_threads if args.index_threads is not None else 1
-        args.align_threads = args.align_threads if args.align_threads is not None else 1
-    cutoff = 0.2 #cosine distance cutoff
-    subdatabase_size = 10000000
-    # reduce_embeddings = True
-    reduce_embeddings = False
-    # print("DEBUG: reduce_embeddings is set to ", reduce_embeddings )
-    group_distance = 0 #when using 0.1, the papilloma query hit 10B proteins, which is too much
-    path_to_centroid_to_prots = os.path.join(os.path.dirname(__file__), "centroid_to_prots")
-
-
     # Set up folder structure
     output_folder = args.output.rstrip("/")
-    if not os.path.exists(output_folder):
-        print(f"Error: Output '{output_folder}' does not exist. Run embed_query.py first.")
+    intermediate_folder = os.path.join(output_folder, "intermediate_files")
+    embeddings_file = os.path.join(intermediate_folder, "query_embeddings.npy")
+    
+    # Check if embeddings need to be created
+    embeddings_exist = os.path.exists(embeddings_file)
+    
+    if not embeddings_exist:
+        # Embeddings don't exist - we need to create them
+        if not args.query_sequences:
+            print("Error: Embeddings not found in output folder, and no --query_sequences provided.")
+            print("Please provide --query_sequences, or run embed_query.py first and provide the folder.")
+            exit(1)
+        
+        print(f"Embeddings not found in {output_folder}. Running embed_query.py automatically...")
+        
+        # Create output folder if it doesn't exist
+        if not os.path.exists(output_folder):
+            os.makedirs(output_folder)
+            print(f"Created output folder: {output_folder}")
+        
+        # Import and run embed_query.py logic
+        import sys as sys_module
+        sys_module.path.insert(0, os.path.dirname(__file__))
+        from embed_query import embed_query_sequences
+        import torch
+        import shutil
+        
+        # Check if GPU is available (unless forced to CPU)
+        if not args.force_cpu:
+            try:
+                gpus_available = torch.cuda.is_available()
+                if gpus_available:
+                    print("GPU available for embedding")
+                else:
+                    print("No GPU available, using CPU for embedding")
+            except ImportError:
+                gpus_available = False
+                print("No GPU available, using CPU for embedding")
+        else:
+            gpus_available = False
+            print("Forced CPU mode for embedding")
+        
+        # Read query sequences from FASTA file
+        query_sequences = []
+        query_names = []
+        sequence_now = ""
+        
+        print(f"Reading query sequences from {args.query_sequences}")
+        with open(args.query_sequences, "r") as query_file_s:
+            for line in query_file_s:
+                if line.startswith(">"):
+                    if sequence_now:
+                        query_sequences.append(sequence_now)
+                        sequence_now = ""
+                    query_names.append(line.strip().lstrip('>'))
+                else:
+                    sequence_now += line.strip()
+            if sequence_now:
+                query_sequences.append(sequence_now)
+        
+        print(f"Found {len(query_sequences)} query sequences")
+        
+        # Create intermediate_files folder
+        os.makedirs(intermediate_folder, exist_ok=True)
+        
+        # Embed the sequences
+        batch_size = 10
+        query_embeddings = embed_query_sequences(
+            query_sequences=query_sequences,
+            gpus_available=gpus_available,
+            batch_size=batch_size
+        )
+        
+        # Save embeddings
+        np.save(embeddings_file, query_embeddings)
+        print(f"Embeddings saved to {embeddings_file}")
+        
+        # Save query names
+        names_file = os.path.join(intermediate_folder, "query_embeddings.names.txt")
+        with open(names_file, 'w') as f:
+            for name in query_names:
+                f.write(f"{name}\n")
+        print(f"Query names saved to {names_file}")
+    else:
+        print(f"Found existing embeddings in {output_folder}")
+    
+    # Validate that query_sequences is provided for MMseqs2 alignment
+    if not args.query_sequences:
+        print("Error: --query_sequences is required for MMseqs2 alignment step.")
+        print("Please provide the path to your query FASTA file.")
         exit(1)
     
-    intermediate_folder = os.path.join(output_folder, "intermediate_files")
-    if not os.path.exists(intermediate_folder):
-        print(f"Error: intermediate_files folder not found in '{output_folder}'. Run embed_query.py first.")
+    # Validate output folder and intermediate files exist
+    if not os.path.exists(output_folder):
+        print(f"Error: Output '{output_folder}' does not exist.")
         exit(1)
+    
+    if not os.path.exists(intermediate_folder):
+        print(f"Error: intermediate_files folder not found in '{output_folder}'.")
+        exit(1)
+    
+    # Auto-calculate thread counts based on memory and available threads
+    args.index_threads = calculate_index_threads(args.database, args.db_type, args.num_threads, args.memory)
+    args.align_threads = args.num_threads  # Use all available threads for alignment
+    
+    print(f"Configuration: index_threads={args.index_threads}, align_threads={args.align_threads}")
+    
+    cutoff = 0.25 #cosine distance cutoff
+    subdatabase_size = 10_000_000
+    group_distance = 0 #when using 0.1, the papilloma query hit 10B proteins, which is too much
+    path_to_centroid_to_prots = os.path.join(os.path.dirname(__file__), "centroid_to_prots")
 
     database = args.database.rstrip("/")
 
@@ -677,12 +849,9 @@ if __name__ == "__main__":
         exit(1)
     query_embeddings = np.load(embeddings_file)
     print(f"Loaded embeddings with shape {query_embeddings.shape}")
-
-    #check that the embeddings are normalized, if not normalize them and print a warning
-    norms = np.linalg.norm(query_embeddings, axis=1)
-    if not np.allclose(norms, 1, atol=1e-3):
-        print("Warning: Embeddings are not normalized, normalizing now...")
-        query_embeddings = query_embeddings / (norms[:, np.newaxis] + 1e-10)
+    
+    query_embeddings_full = query_embeddings.copy()
+    original_cutoff = cutoff
 
     # Load and apply PCA if it exists in the database folder
     pca, n_pca_components = load_pca_if_exists(database)
@@ -690,9 +859,16 @@ if __name__ == "__main__":
         print(f"Found PCA model in database folder. Applying PCA with {n_pca_components} components...")
         query_embeddings = apply_pca_to_query(query_embeddings, pca)
         print(f"Query embeddings transformed to shape {query_embeddings.shape}")
-        cutoff = cutoff + 0.03 # increase cutoff to account for PCA dimensionality reduction (this is an empirical value, may need tuning)
+        cutoff = cutoff - 0.03 # decrease cutoff to account for PCA dimensionality reduction, which shrinks angles
     else:
         print("No PCA model found. Using original 512-dimensional embeddings.")
+
+    #check that the embeddings are normalized, if not normalize them and print a warning
+    norms = np.linalg.norm(query_embeddings, axis=1)
+    if not np.allclose(norms, 1, atol=1e-3):
+        if pca is None:
+            print("Warning: Embeddings are not normalized, normalizing now...")
+        query_embeddings = query_embeddings / (norms[:, np.newaxis] + 1e-10)
 
     # Load query names from intermediate folder
     names_file = os.path.join(intermediate_folder, "query_embeddings.names.txt")
@@ -705,18 +881,10 @@ if __name__ == "__main__":
         print(f"Warning: Query names file not found at {names_file}")
         print("Generating generic query names...")
         query_names = [f"query_{i}" for i in range(len(query_embeddings))]
+        
+    query_names_full = query_names.copy()
 
     print(f"Number of queries: {len(query_names)}")
-
-    # Optionally reduce embeddings by clustering similar ones
-    if reduce_embeddings:
-        print("Reducing embeddings by clustering...")
-        original_count = len(query_embeddings)
-        query_embeddings, max_dist = reduce_number_of_embeddings(query_embeddings, threshold=group_distance)
-        # For reduced embeddings, we use generic names since we're representing clusters
-        query_names = [f"cluster_{i}" for i in range(len(query_embeddings))]
-        print(f"Embeddings reduced from {original_count} to {len(query_embeddings)}")
-        cutoff += max_dist
 
     t1 = time.time()
     
@@ -732,6 +900,8 @@ if __name__ == "__main__":
             max_workers=args.index_threads
         )
         db_name = "usearch"
+        time_taken = time.time() - t1
+        print(f"Completed searching the vector database in {time_taken:.2f} seconds")
     else:  # faiss
         cutoff = cutoff * 2  # convert cosine distance to L2² (FAISS Flat index returns squared L2 distance)
         print("the new cutoff for FAISS search is ", cutoff)
@@ -745,9 +915,19 @@ if __name__ == "__main__":
             max_workers=args.index_threads
         )
         db_name = "FAISS"
+        
+    # filter pca hits if PCA was active
+    if pca is not None and os.path.exists(os.path.join(database, "centroids.fa.embeddings")):
+        embeddings_file_path = os.path.join(database, "centroids.fa.embeddings")
+        # filter PCA hits using the original cut-off if possible (ignoring max_dst offset or keeping it)
+        # using the original base cutoff
+        filter_cutoff = original_cutoff
+        query_results = filter_pca_hits(query_embeddings_full, query_names_full, query_results, embeddings_file_path, filter_cutoff, max_workers=args.index_threads)
+    else:
+        # Strip the c_idx element since we didn't use filter_pca_hits
+        query_results = [res[:4] for res in query_results]
     
     t2 = time.time()
-    print(f"Time for querying {db_name} database: {t2 - t1:.2f} seconds. {len(query_results)} centroids")
 
     if len(query_results) == 0:
         print("No results, exiting")
@@ -786,9 +966,8 @@ if __name__ == "__main__":
 
     # Align centroids against query using MMseqs2 to filter results
     t_align_start = time.time()
-    matched_centroids = align_centroids_with_mmseqs2(unique_fasta, args.query_sequences, args.index_threads)
+    matched_centroids = align_centroids_with_mmseqs2(unique_fasta, args.query_sequences, args.align_threads, intermediate_folder)
     t_align_end = time.time()
-    print(f"Time for centroid alignment: {t_align_end - t_align_start:.2f} seconds")
 
     # Filter query_results to keep only centroids that aligned with the query
     # Extract centroid IDs from the matched set (handling '>' prefix and header parsing)
@@ -849,21 +1028,20 @@ if __name__ == "__main__":
 
         # Run MMseqs2 and write main output files to output folder root
         mmseqs2_output = os.path.join(output_folder, "matches.mmseqs2")
-        mmseqs2_results(all_results, args.query_sequences, args.outfmt, mmseqs2_output, args.align_threads)
+        mmseqs2_results(all_results, args.query_sequences, args.outfmt, mmseqs2_output, args.align_threads, intermediate_folder)
         t4 = time.time()
 
         # Create top hit file in intermediate_files
         top_hit_file = os.path.join(intermediate_folder, "matches.top_hit")
         command = f"awk '!seen[$1]++' {mmseqs2_output} > {top_hit_file}"  # to keep only the first hit
         subprocess.run(command, shell=True, check=True)
-
-        print(f"Time for obtaining all proteins: {t4_start - t3:.2f} seconds")
-        print(f"Time for running MMseqs2: {t4 - t4_start:.2f} seconds")
     else:
         t4 = t3
         print("No filtered results, skipping protein extraction and MMseqs2 alignment")
 
     print(f"Time for querying {db_name} database: {t2 - t1:.2f} seconds")
     print(f"Time for centroid alignment: {t_align_end - t_align_start:.2f} seconds")
+    print(f"Time for obtaining all proteins: {t4_start - t3:.2f} seconds" if len(filtered_query_results) > 0 else "No filtered results, skipping protein extraction")
+    print(f"Time for running MMseqs2: {t4 - t4_start:.2f} seconds" if len(filtered_query_results) > 0 else "No filtered results, skipping MMseqs2 alignment")
     print(f"Total time: {t4 - t1:.2f} seconds")
     
