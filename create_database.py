@@ -811,7 +811,7 @@ if __name__ == "__main__":
     usearch_parser = subparsers.add_parser('usearch', help='Create USEARCH database from embeddings.')
     usearch_parser.add_argument("input_fasta", type=str, help="Path to the input FASTA file (used for naming).")
     usearch_parser.add_argument("database_folder", type=str, help="Path to the folder containing embeddings and where USEARCH DB will be saved.")
-    usearch_parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each usearch subdatabase (default: 10000000).")
+    usearch_parser.add_argument("--subdatabases_size", type=int, default=10_000_000, help="Number of vectors in each usearch subdatabase (default: 10000000).")
     usearch_parser.add_argument("--num_cpus", type=int, default=1, help="Number of CPU threads to use for building subdatabases (default: 1).")
     usearch_parser.add_argument("--pca_components", type=int, default=None, help="Number of PCA components to reduce dimensions to (default: None, no PCA). If specified, embeddings will be reduced to this many dimensions using PCA.")
     usearch_parser.add_argument("-F", "--force", action="store_true", help="Force overwrite of database files if desired (not applied automatically).")
