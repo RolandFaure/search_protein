@@ -264,7 +264,7 @@ def search_usearch_database(original_fasta, database_folder, query_embeddings, q
 
     usearch_database_folder = database_folder + "/usearch"
     bin_files = [file for file in os.listdir(usearch_database_folder) if file.endswith(".bin")]
-    bin_files = bin_files[:1] # DEBUG - limit to first bins for testing
+    # bin_files = bin_files[:1] # DEBUG - limit to first bins for testing
     # print("DEBUUUUUGUGkkk")
 
     all_results = []
@@ -704,8 +704,8 @@ def calculate_index_threads(database_folder, db_type, max_threads, max_memory_gb
     bin_size_bytes = os.path.getsize(bin_path)
     bin_size_gb = bin_size_bytes / (1024 ** 3)
     
-    # RAM needed per thread is approximately: bin_size * 10
-    ram_per_thread_gb = bin_size_gb * 10
+    # RAM needed per thread is empirically: bin_size * 3
+    ram_per_thread_gb = bin_size_gb * 3
     
     if ram_per_thread_gb <= 0:
         print("Warning: Bin file is empty or too small. Defaulting to 1 thread.")
