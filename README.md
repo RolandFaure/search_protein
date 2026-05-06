@@ -88,8 +88,9 @@ python search_database.py \
 **Output files:**
 ```
 results_folder/
-├── matches.fasta          # Main output: matched proteins
-├── matches.mmseqs2        # MMseqs2 alignment results
+├── diversified_hits.tsv   # Set of proteins related to you queries according to the gLM2 protein language model
+├── matches.fasta          # Set of proteins aligning on your queries according to mmseqs2
+├── matches.mmseqs2        # Detail of the mmseqs2 alignments
 └── intermediate_files/
     ├── query_embeddings.npy
     ├── query_embeddings.names.txt
@@ -102,8 +103,17 @@ results_folder/
 
 ## Main Output Files
 
+- **`diversified_hits.tsv`**: TSV files containing Logan proteins which gLM2 embeddings have a cosine distance of less 0.2 to the embeddings fo the query.
+```
+#query_name     result_name     result_sequences        cosine_distance
+alpha      ERR11474596_7103_1      MLDWNTSSDIFVEKLLQRNYKSQSLHSQPRHRPQVDGIPYEFGYKGTIYPMNKSRNCIIILLLIPVLVHSTRNAAYFESLEMKIVEQVKLNRAQGKWQLVRELLGLKGTFLKPRWQHFAKTVSSRDFFGNWLPLMLEIERYLYSKKMYPDSYLSWDDHSSYRVRKKVYRRGYDDKGSRRPEHKWFPENAFSRELLDEVPVKRAVYKPFELYHGYSEKRRRRSSLSSLLDL* 0.015888094902038574
+```
 - **`matches.fasta`**: FASTA file containing all matched protein sequences
 - **`matches.mmseqs2`**: MMseqs2 alignment results of matched protein versus queries
+```
+#target  query  identity        alignment_length        nb_mismatches   nb_gap_openings target_start     target_end       query_start    query_end      evalue  bitscore
+SRR21885923_17279_1#87#695#-1   alpha   0.924   202     15      0       1       202     1       202     4.604E-129      393
+```
 
 ## Complete Example
 
