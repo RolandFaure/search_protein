@@ -536,7 +536,7 @@ def mmseqs2_results(results, query_fasta, output_format, output_file, num_thread
             if output_file:
                 with open(output_file, "w") as out_f:
                     if output_format == '0':  # this is the default, output the header
-                        out_f.write("#target\tquery\tidentity\talignment_length\tnb_mismatches\tnb_gap_openings\tquery_start\tquery_end\ttarget_start\ttarget_end\tevalue\tbitscore\n")
+                        out_f.write("#target\tquery\tidentity\talignment_length\tnb_mismatches\tnb_gap_openings\ttarget_start\ttarget_end\tquery_start\tquery_end\tevalue\tbitscore\n")
                     out_f.write(resf.read())
             else:
                 print(resf.read())
