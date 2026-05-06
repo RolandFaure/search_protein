@@ -36,7 +36,11 @@ Then download the repo
 # Clone the repository
 git clone https://github.com/RolandFaure/search_protein.git
 ```
-
+And compile the C++ scripts
+```bash
+cd search_protein
+make
+```
 
 ## Quick Start
 
