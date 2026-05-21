@@ -25,7 +25,52 @@ from usearch.index import Index,search, MetricKind, BatchMatches
 import datetime
 import pca
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
+
+class UncenteredPCA:
+    """
+    Uncentered PCA using SVD-based rotation without mean subtraction.
+    
+    This preserves cosine distances between normalized vectors better than centered PCA.
+    Unlike standard PCA which subtracts the mean, uncentered PCA is just a rotation
+    in the original space, preserving angles and thus cosine distances.
+    """
+    def __init__(self, n_components):
+        self.n_components_ = n_components
+        self.components_ = None  # Shape: (n_components, d)
+        self.singular_values_ = None
+        self.mean_ = None  # Always zero for uncentered PCA
+    
+    def fit(self, X):
+        """
+        Fit uncentered PCA using SVD on the data directly (no centering).
+        
+        Args:
+            X: Input data matrix of shape (n_samples, n_features)
+        
+        Returns:
+            self
+        """
+        # Compute SVD without centering
+        U, S, Vt = np.linalg.svd(X, full_matrices=False)
+        
+        # Store the rotation matrix from right singular vectors
+        self.components_ = Vt[:self.n_components_, :]  # Shape: (n_components, d)
+        self.singular_values_ = S[:self.n_components_]
+        self.mean_ = np.zeros(X.shape[1], dtype=np.float32)  # Zero mean for uncentered
+        return self
+    
+    def transform(self, X):
+        """
+        Apply rotation transformation to data.
+        
+        Args:
+            X: Input data matrix of shape (n_samples, n_features)
+        
+        Returns:
+            Transformed data of shape (n_samples, n_components)
+        """
+        return X @ self.components_.T
 
 def load_pca_if_exists(database_folder):
     """
@@ -38,25 +83,31 @@ def load_pca_if_exists(database_folder):
         tuple: (PCA model, n_components) or (None, None) if PCA doesn't exist
     """
     pca_folder = os.path.join(database_folder, "pca")
-    pca_model_file = os.path.join(pca_folder, "pca_model.pkl")
+    components_file = os.path.join(pca_folder, "components.npy")
+    singular_values_file = os.path.join(pca_folder, "singular_values.npy")
     
-    if not os.path.exists(pca_model_file):
+    if not os.path.exists(components_file) or not os.path.exists(singular_values_file):
         return None, None
     
-    import pickle
-    with open(pca_model_file, "rb") as f:
-        pca = pickle.load(f)
+    # Load components and singular values, reconstruct UncenteredPCA object
+    components = np.load(components_file)
+    singular_values = np.load(singular_values_file)
     
-    n_components = pca.n_components_
+    n_components = components.shape[0]
+    pca = UncenteredPCA(n_components=n_components)
+    pca.components_ = components
+    pca.singular_values_ = singular_values
+    pca.mean_ = np.zeros(components.shape[1], dtype=np.float32)
+    
     return pca, n_components
 
 def apply_pca_to_query(query_embeddings, pca):
     """
-    Apply PCA transformation to query embeddings and keep only first n_components.
+    Apply uncentered PCA transformation to query embeddings.
     
     Args:
         query_embeddings (np.ndarray): Query embeddings (shape: [n_queries, 512])
-        pca: Fitted PCA model
+        pca: UncenteredPCA model
     
     Returns:
         np.ndarray: Transformed embeddings (shape: [n_queries, n_components])

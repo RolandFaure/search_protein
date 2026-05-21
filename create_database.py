@@ -1,6 +1,5 @@
 import torch
 from transformers import AutoModel, AutoTokenizer, AutoModelForMaskedLM, T5Tokenizer, BertConfig
-from sklearn.decomposition import PCA
 import numpy as np
 import time
 import sys
@@ -20,11 +19,40 @@ import shutil
 
 d = 512
 
-__version__ = "2.0.1"
+__version__ = "2.1.0"
+
+class UncenteredPCA:
+    """
+    Uncentered PCA using SVD-based rotation without mean subtraction.
+    This preserves cosine distances between normalized vectors better than centered PCA.
+    """
+    def __init__(self, n_components):
+        self.n_components_ = n_components
+        self.components_ = None  # Shape: (n_components, d)
+        self.singular_values_ = None
+        self.mean_ = None  # Always zero for uncentered PCA
+    
+    def fit(self, X):
+        """Fit uncentered PCA using SVD on the data directly (no centering)."""
+        # Compute SVD without centering
+        U, S, Vt = np.linalg.svd(X, full_matrices=False)
+        
+        # Store the rotation matrix from right singular vectors
+        self.components_ = Vt[:self.n_components_, :]  # Shape: (n_components, d)
+        self.singular_values_ = S[:self.n_components_]
+        self.mean_ = np.zeros(X.shape[1], dtype=np.float32)  # Zero mean for uncentered
+        return self
+    
+    def transform(self, X):
+        """Apply rotation transformation: X @ components_.T"""
+        return X @ self.components_.T
+
 
 def compute_and_save_pca(embedding_file, database_folder, n_components=64, n_samples=10_000_000):
     """
-    Load the first n_samples vectors from embeddings, fit PCA, and save it.
+    Compute uncentered PCA using SVD and save the model.
+    
+    Uncentered PCA preserves cosine distances better than standard (centered) PCA.
     
     Args:
         embedding_file (str): Path to the embeddings file.
@@ -33,9 +61,9 @@ def compute_and_save_pca(embedding_file, database_folder, n_components=64, n_sam
         n_samples (int): Number of vectors to use for PCA fitting (default: 10_000_000).
     
     Returns:
-        PCA model object
+        UncenteredPCA model object
     """
-    print(f"Computing PCA with {n_components} components using {n_samples} samples...")
+    print(f"Computing uncentered PCA with {n_components} components using {n_samples} samples...")
     pca_folder = os.path.join(database_folder, "pca")
     os.makedirs(pca_folder, exist_ok=True)
     
@@ -51,27 +79,28 @@ def compute_and_save_pca(embedding_file, database_folder, n_components=64, n_sam
     
     print(f"Loaded {num_vectors} vectors for PCA fitting")
     
-    # Fit PCA
-    print(f"Fitting PCA...")
-    pca = PCA(n_components=n_components, random_state=42)
+    # Fit uncentered PCA using SVD
+    print(f"Fitting uncentered PCA (SVD-based)...")
+    pca = UncenteredPCA(n_components=n_components)
     pca.fit(vectors)
     
-    # Save PCA model and stats
-    import pickle
-    pca_model_file = os.path.join(pca_folder, "pca_model.pkl")
-    with open(pca_model_file, "wb") as f:
-        pickle.dump(pca, f)
-    print(f"PCA model saved to {pca_model_file}")
+    # Save PCA model components as numpy files (not as pickle for portability)
+    components_file = os.path.join(pca_folder, "components.npy")
+    singular_values_file = os.path.join(pca_folder, "singular_values.npy")
+    np.save(components_file, pca.components_)
+    np.save(singular_values_file, pca.singular_values_)
+    print(f"Uncentered PCA components saved to {components_file}")
     
     # Save stats
+    explained_variance_ratio = (pca.singular_values_ ** 2) / np.sum(pca.singular_values_ ** 2)
     stats = {
         "n_components": n_components,
         "n_samples_used": num_vectors,
-        "explained_variance_ratio": pca.explained_variance_ratio_.tolist(),
-        "cumulative_explained_variance": np.cumsum(pca.explained_variance_ratio_).tolist(),
-        "total_explained_variance": float(np.sum(pca.explained_variance_ratio_)),
+        "pca_type": "uncentered",
+        "explained_variance_ratio": explained_variance_ratio.tolist(),
+        "cumulative_explained_variance": np.cumsum(explained_variance_ratio).tolist(),
+        "total_explained_variance": float(np.sum(explained_variance_ratio)),
         "singular_values": pca.singular_values_.tolist(),
-        "mean": pca.mean_.tolist(),
     }
     
     import json
@@ -94,16 +123,22 @@ def load_pca(pca_folder):
     Returns:
         tuple: (PCA model, n_components) or (None, None) if PCA doesn't exist
     """
-    pca_model_file = os.path.join(pca_folder, "pca_model.pkl")
+    components_file = os.path.join(pca_folder, "components.npy")
+    singular_values_file = os.path.join(pca_folder, "singular_values.npy")
     
-    if not os.path.exists(pca_model_file):
+    if not os.path.exists(components_file) or not os.path.exists(singular_values_file):
         return None, None
     
-    import pickle
-    with open(pca_model_file, "rb") as f:
-        pca = pickle.load(f)
+    # Load components and singular values, reconstruct UncenteredPCA object
+    components = np.load(components_file)
+    singular_values = np.load(singular_values_file)
     
-    n_components = pca.n_components_
+    n_components = components.shape[0]
+    pca = UncenteredPCA(n_components=n_components)
+    pca.components_ = components
+    pca.singular_values_ = singular_values
+    pca.mean_ = np.zeros(components.shape[1], dtype=np.float32)
+    
     return pca, n_components
 
 def apply_pca_to_embeddings(embedding_file, database_folder, pca, n_components):
