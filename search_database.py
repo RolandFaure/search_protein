@@ -3,13 +3,6 @@
 Search a FAISS/usearch database using pre-computed query embeddings.
 """
 import os
-#limit the number of threads used by FAISS and other libraries to avoid oversubscription when using ProcessPoolExecutor
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
 
 import faiss
 import argparse
@@ -20,104 +13,12 @@ import numpy as np
 import sys
 import tempfile
 import subprocess
+import mmap
 from sklearn.metrics.pairwise import cosine_distances
 from usearch.index import Index,search, MetricKind, BatchMatches
 import datetime
-import pca
 
-__version__ = "2.5.0"
-
-class UncenteredPCA:
-    """
-    Uncentered PCA using SVD-based rotation without mean subtraction.
-    
-    This preserves cosine distances between normalized vectors better than centered PCA.
-    Unlike standard PCA which subtracts the mean, uncentered PCA is just a rotation
-    in the original space, preserving angles and thus cosine distances.
-    """
-    def __init__(self, n_components):
-        self.n_components_ = n_components
-        self.components_ = None  # Shape: (n_components, d)
-        self.singular_values_ = None
-        self.mean_ = None  # Always zero for uncentered PCA
-    
-    def fit(self, X):
-        """
-        Fit uncentered PCA using SVD on the data directly (no centering).
-        
-        Args:
-            X: Input data matrix of shape (n_samples, n_features)
-        
-        Returns:
-            self
-        """
-        # Compute SVD without centering
-        U, S, Vt = np.linalg.svd(X, full_matrices=False)
-        
-        # Store the rotation matrix from right singular vectors
-        self.components_ = Vt[:self.n_components_, :]  # Shape: (n_components, d)
-        self.singular_values_ = S[:self.n_components_]
-        self.mean_ = np.zeros(X.shape[1], dtype=np.float32)  # Zero mean for uncentered
-        return self
-    
-    def transform(self, X):
-        """
-        Apply rotation transformation to data.
-        
-        Args:
-            X: Input data matrix of shape (n_samples, n_features)
-        
-        Returns:
-            Transformed data of shape (n_samples, n_components)
-        """
-        return X @ self.components_.T
-
-def load_pca_if_exists(database_folder):
-    """
-    Load PCA model and components from database folder if it exists.
-    
-    Args:
-        database_folder (str): Path to the database folder.
-    
-    Returns:
-        tuple: (PCA model, n_components) or (None, None) if PCA doesn't exist
-    """
-    pca_folder = os.path.join(database_folder, "pca")
-    components_file = os.path.join(pca_folder, "components.npy")
-    singular_values_file = os.path.join(pca_folder, "singular_values.npy")
-    
-    if not os.path.exists(components_file) or not os.path.exists(singular_values_file):
-        return None, None
-    
-    # Load components and singular values, reconstruct UncenteredPCA object
-    components = np.load(components_file)
-    singular_values = np.load(singular_values_file)
-    
-    n_components = components.shape[0]
-    pca = UncenteredPCA(n_components=n_components)
-    pca.components_ = components
-    pca.singular_values_ = singular_values
-    pca.mean_ = np.zeros(components.shape[1], dtype=np.float32)
-    
-    return pca, n_components
-
-def apply_pca_to_query(query_embeddings, pca):
-    """
-    Apply uncentered PCA transformation to query embeddings.
-    
-    Args:
-        query_embeddings (np.ndarray): Query embeddings (shape: [n_queries, 512])
-        pca: UncenteredPCA model
-    
-    Returns:
-        np.ndarray: Transformed embeddings (shape: [n_queries, n_components])
-    """
-    transformed = pca.transform(query_embeddings.astype(np.float32))
-    # Normalize after PCA to preserve unit length property
-    transformed = transformed.astype(np.float32)
-    norms = np.linalg.norm(transformed, axis=1, keepdims=True)
-    transformed = transformed / (norms + 1e-10)
-    return transformed
+__version__ = "2.8.0"
 
 def query_bin(bin_file, original_fasta, database_folder, query_embeddings, query_names, subdatabase_size, cutoff):
     start_time = time.time()
@@ -125,8 +26,6 @@ def query_bin(bin_file, original_fasta, database_folder, query_embeddings, query
 
     file_starting_pos = int(bin_file.strip(".bin").split("_")[2])*subdatabase_size
     index_path = os.path.join(database_folder, bin_file)
-    # Load the FAISS index using memory mapping to avoid loading entirely in RAM
-    # index = faiss.read_index(index_path, faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY)
     index = faiss.read_index(index_path)
     nb_of_searches = 1
     distances = []
@@ -135,29 +34,21 @@ def query_bin(bin_file, original_fasta, database_folder, query_embeddings, query
         distances, indices = index.search(query_embeddings, k=k)
         nb_of_searches += 1
 
-    results = [[] for _ in range(len(distances))]
-    for i, (dist_row, idx_row) in enumerate(zip(distances, indices)):
+    # Organize results: match_idx -> [(query_idx, distance), ...]
+    matches_to_queries = {}
+    for query_idx, (dist_row, idx_row) in enumerate(zip(distances, indices)):
         for dist, idx in zip(dist_row, idx_row):
             if dist < cutoff:
-                results[i].append((file_starting_pos + idx, dist))
+                match_idx = int(file_starting_pos + idx)
+                if match_idx not in matches_to_queries:
+                    matches_to_queries[match_idx] = []
+                matches_to_queries[match_idx].append((query_idx, dist))
 
-    results_sorted = [sorted(result, key=lambda x: x[1]) for result in results]
-    final_results = []
-    names_file = os.path.join(database_folder, f"{os.path.basename(original_fasta)}.names")
-    with open(names_file, "rb") as nf, open(original_fasta, "r") as fastafile : #, open("/pasteur/appa/scratch/rfaure/human_db_usearch/centroids.fa.embeddings", "rb") as embeddings_file:
-        for query_idx in range(len(results_sorted)):
-            for result in results_sorted[query_idx]:
-                nf.seek(8 * result[0])
-                position_name = int.from_bytes(nf.read(8), byteorder='little', signed=False)
-                fastafile.seek(position_name)
-                name_line = fastafile.readline().strip()
-                sequence_line = fastafile.readline().strip()
-                final_results.append((query_names[query_idx], name_line, sequence_line, result[1], int(result[0])))
-
+    print(f"Total distinct matches for bin {bin_file}: {len(matches_to_queries)}")
+    
     elapsed_time = time.time() - start_time
-    print(f"Total matches for bin {bin_file}: {np.sum([len(result) for result in results])}")
     print(f"Time taken for querying bin {bin_file}: {elapsed_time:.2f} seconds")
-    return final_results
+    return matches_to_queries
 
 def search_faiss_database(original_fasta, database_folder, query_embeddings, query_names, cutoff=0.2, subdatabase_size=10000000, max_workers=4):
     """
@@ -180,19 +71,24 @@ def search_faiss_database(original_fasta, database_folder, query_embeddings, que
     faiss_database_folder = database_folder+"/faiss"
     bin_files = [file for file in os.listdir(faiss_database_folder) if file.endswith(".bin")]
 
-    all_results = []
+    all_results = {}
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(query_bin, bin_file, original_fasta, faiss_database_folder, query_embeddings, query_names, subdatabase_size, cutoff) for bin_file in bin_files
         ]
         for future in as_completed(futures):
-            all_results.extend(future.result())
+            bin_results = future.result()
+            # Merge bin_results dict into all_results
+            for match_idx, query_hits in bin_results.items():
+                if match_idx not in all_results:
+                    all_results[match_idx] = []
+                all_results[match_idx].extend(query_hits)
 
     return all_results
 
 
 def query_usearch_bin(bin_file, original_fasta, database_folder, query_embeddings, query_names, subdatabase_size, cutoff):
-    """Query a single usearch index file and return results."""
+    """Query a single usearch index file and return results as dict: match_idx -> [(query_idx, distance), ...]"""
     start_time = time.time()
 
     file_starting_pos = int(bin_file.strip(".bin").split("_")[2]) * subdatabase_size
@@ -200,20 +96,13 @@ def query_usearch_bin(bin_file, original_fasta, database_folder, query_embedding
     
     # Load the usearch index
     index = Index(ndim=512, metric='cos')
-    index.load(index_path) #without memory-mapping
-    # index = Index.restore(index_path, view=True) #with memory-mapping
-    
-    # # Load PCA model if it exists (needed for debug distance calculations)
-    # pca, _ = load_pca_if_exists("/pasteur/appa/scratch/rfaure/nonhuman_db_usearch_pca/")
-    # print("DEBUG osfuoiu")
+    index.load(index_path)
     
     # Search with increasing k until we get results beyond the cutoff
     nb_of_searches = 1
     all_matches = None
     while nb_of_searches <= 10:
         k = 2000 * 2 ** nb_of_searches
-        # print("query embedding shape ", query_embeddings.shape, " searching with k=", k, " on index ", index_path)
-        # query_embeddings = np.array([query_embeddings[0], query_embeddings[0]])
         matches : BatchMatches = index.search(query_embeddings, k, exact=False)
         if query_embeddings.shape[0] == 1:
             matches = [matches]
@@ -222,7 +111,6 @@ def query_usearch_bin(bin_file, original_fasta, database_folder, query_embedding
         max_distance = 0
         for i in range(len(matches)):
             if len(matches[i]) > 0:
-                # Get the farthest match for this query
                 last_valid_idx = len(matches[i]) - 1
                 max_distance = max(max_distance, matches[i][last_valid_idx].distance)
         
@@ -233,67 +121,25 @@ def query_usearch_bin(bin_file, original_fasta, database_folder, query_embedding
         nb_of_searches += 1
     
     if all_matches is None:
-        return []
+        return {}
 
-    # print("Finished searching with k=", k, " max distance found: ", max_distance, " number of matches: ", sum(len(m) for m in all_matches))
-    
-    # Process results
-    results = [[] for _ in range(len(query_embeddings))]
-    for i in range(len(all_matches)):
-        for j in range(len(all_matches[i])):
-            dist = all_matches[i][j].distance
+    # Organize results: match_idx -> [(query_idx, distance), ...]
+    matches_to_queries = {}
+    for query_idx in range(len(all_matches)):
+        for j in range(len(all_matches[query_idx])):
+            dist = all_matches[query_idx][j].distance
             if dist < cutoff:
-                key = all_matches[i][j].key
-                results[i].append((file_starting_pos + key, dist))
+                key = all_matches[query_idx][j].key
+                match_idx = int(file_starting_pos + key)
+                if match_idx not in matches_to_queries:
+                    matches_to_queries[match_idx] = []
+                matches_to_queries[match_idx].append((query_idx, dist))
 
-    print(f"Total matches for bin {bin_file}: {np.sum([len(result) for result in results])}")
-    time_usearch = time.time()
+    print(f"Total distinct matches for bin {bin_file}: {len(matches_to_queries)}")
     
-    results_sorted = [sorted(result, key=lambda x: x[1]) for result in results]
-    final_results = []
-    
-    # Optimize file access: collect all unique indices, sort them, then read all at once
-    time_postproc = time.time()
-    
-    # Collect all unique indices and their corresponding query_idx and distance
-    all_indices_to_read = {}  # index -> list of (query_idx, distance)
-    for query_idx, results_for_query in enumerate(results_sorted):
-        for result in results_for_query:
-            idx = int(result[0])
-            if idx not in all_indices_to_read:
-                all_indices_to_read[idx] = []
-            all_indices_to_read[idx].append((query_idx, result[1]))
-    
-    # Sort indices for better I/O locality
-    sorted_indices = sorted(all_indices_to_read.keys())
-    
-    # Read all data in one sequential pass through the files
-    index_to_data = {}  # Cache: index -> (name_line, sequence_line)
-    names_file = os.path.join(database_folder, f"{os.path.basename(original_fasta)}.names")
-    
-    with open(names_file, "rb") as nf, open(original_fasta, "r") as fastafile:
-        for idx in sorted_indices:
-            # Read position from names file
-            nf.seek(8 * idx)
-            position_name = int.from_bytes(nf.read(8), byteorder='little', signed=False)
-            
-            # Read from fasta file
-            fastafile.seek(position_name)
-            name_line = fastafile.readline().strip()
-            sequence_line = fastafile.readline().strip()
-            
-            # Cache the data
-            index_to_data[idx] = (name_line, sequence_line)
-    
-    # Now construct results using the cached data
-    for idx in sorted_indices:
-        name_line, sequence_line = index_to_data[idx]
-        for query_idx, distance in all_indices_to_read[idx]:
-            final_results.append((query_names[query_idx], name_line, sequence_line, distance, idx))
-
     elapsed_time = time.time() - start_time
-    print(f"Time taken for querying bin {bin_file}: {elapsed_time:.2f} seconds, time for post-processing: {time.time() - time_usearch:.2f} seconds")
-    return final_results
+    print(f"Time taken for querying bin {bin_file}: {elapsed_time:.2f} seconds")
+    return matches_to_queries
 
 def search_usearch_database(original_fasta, database_folder, query_embeddings, query_names, cutoff=0.2, subdatabase_size=10000000, max_workers=4):
     """
@@ -315,134 +161,198 @@ def search_usearch_database(original_fasta, database_folder, query_embeddings, q
 
     usearch_database_folder = database_folder + "/usearch"
     bin_files = [file for file in os.listdir(usearch_database_folder) if file.endswith(".bin")]
-    # bin_files = bin_files[:1] # DEBUG - limit to first bins for testing
+    
+    # # #DEBUG: Only use one random bin file to speed up testing
+    # bin_file_random = np.random.randint(0,len(bin_files))
+    # bin_files = bin_files[bin_file_random:bin_file_random+100]
     # print("DEBUUUUUGUGkkk")
 
-    all_results = []
+    all_results = {}
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(query_usearch_bin, bin_file, original_fasta, usearch_database_folder, query_embeddings, query_names, subdatabase_size, cutoff) 
             for bin_file in bin_files
         ]
         for future in as_completed(futures):
-            all_results.extend(future.result())
+            bin_results = future.result()
+            # Merge bin_results dict into all_results
+            for match_idx, query_hits in bin_results.items():
+                if match_idx not in all_results:
+                    all_results[match_idx] = []
+                all_results[match_idx].extend(query_hits)
     return all_results
 
 
-def _load_embeddings_chunk(args_tuple):
+def _read_embedding_batch(args):
+    """Helper function for parallel embedding reading (full 512 dims). Must be at module level for ThreadPoolExecutor.
+    Returns embeddings as a list in the same order as input indices (NOT normalized).
+    Uses buffered I/O to reduce seek operations: loads 100 embeddings at a time.
     """
-    Worker function to load a chunk of embeddings from disk.
-    Indices are already sorted, so sequential reads are efficient.
-    """
-    embeddings_file_path, chunk_idxs = args_tuple
+    embeddings_file_path, match_indices_batch = args
+    BUFFER_SIZE = 100 # Load 100 embeddings per seek
+    EMBEDDING_SIZE_BYTES = 512 * 2
     
-    chunk_embeddings = np.zeros((len(chunk_idxs), 512), dtype=np.float32)
+    # Use dict to maintain index->embedding mapping, then return as list in original order
+    result_list = [None] * len(match_indices_batch)  # Placeholder for results in original order
+    buffer_bytes = b''  # Cache of loaded embeddings
+    buffer_start = None
+    buffer_end = None
+    nb_seeks = 0
+    
+    # Aggregate timing stats
+    nb_cache_hits = 0
+    nb_cache_misses = 0
+    total_seek_time = 0.0
+    total_read_time = 0.0
+    total_frombuffer_hit_time = 0.0
+    total_frombuffer_miss_time = 0.0
     
     with open(embeddings_file_path, "rb") as embeddings_file:
-        for i, c_idx in enumerate(chunk_idxs):
-            embeddings_file.seek(512 * 2 * c_idx)
-            embedding_bytes = embeddings_file.read(512 * 2)
-            chunk_embeddings[i] = np.frombuffer(embedding_bytes, dtype=np.float16).astype(np.float32)
-            
-    return chunk_embeddings
+        for match_idx_idx, match_idx in enumerate(match_indices_batch):
+            # Check if idx is in current buffer
+            if buffer_start is not None and buffer_start <= match_idx < buffer_end:
+                # Cache hit: time the frombuffer operation
+                # t_frombuffer_start = time.time()
+                result_list[match_idx_idx] = np.frombuffer(buffer_bytes[(match_idx - buffer_start) * EMBEDDING_SIZE_BYTES:(match_idx - buffer_start + 1) * EMBEDDING_SIZE_BYTES], dtype=np.float16).astype(np.float32)
+                # total_frombuffer_hit_time += time.time() - t_frombuffer_start
+                nb_cache_hits += 1
+            else:
+                # Cache miss: time seek, read, and frombuffer separately
+                nb_seeks += 1
+                nb_cache_misses += 1
+                buffer_start = match_idx
+                buffer_end = match_idx + BUFFER_SIZE
+                
+                # t_seek_start = time.time()
+                embeddings_file.seek(EMBEDDING_SIZE_BYTES * match_idx)
+                # total_seek_time += time.time() - t_seek_start
+                
+                # t_read_start = time.time()
+                buffer_bytes = embeddings_file.read(EMBEDDING_SIZE_BYTES * BUFFER_SIZE)
+                # total_read_time += time.time() - t_read_start
+                
+                # t_frombuffer_start = time.time()
+                result_list[match_idx_idx] = np.frombuffer(buffer_bytes[:EMBEDDING_SIZE_BYTES], dtype=np.float16).astype(np.float32)
+                # total_frombuffer_miss_time += time.time() - t_frombuffer_start
 
-def filter_pca_hits(query_embeddings_full, query_names, query_results, embeddings_file_path, cutoff, max_workers=4, max_vectors_per_chunk=1000000):
-    """
-    Filter hits returned by the PCA index by recalculating true Cosine distance 
-    on the full 512-dimension vectors. 
+    # Print aggregated timing summary
+    total_time = total_seek_time + total_read_time + total_frombuffer_hit_time + total_frombuffer_miss_time
+    # print(f"Timing summary for _read_embedding_batch ({len(match_indices_batch)} embeddings):")
+    # print(f"  Cache hits: {nb_cache_hits}, Cache misses: {nb_cache_misses} ({nb_seeks} seeks)")
+    # print(f"  Seek time (total): {total_seek_time*1000:.3f}ms (avg per miss: {total_seek_time*1000/max(1,nb_cache_misses):.3f}ms)")
+    # print(f"  Read time (total): {total_read_time*1000:.3f}ms (avg per miss: {total_read_time*1000/max(1,nb_cache_misses):.3f}ms)")
+    # print(f"  Frombuffer time (hits): {total_frombuffer_hit_time*1000:.3f}ms (avg: {total_frombuffer_hit_time*1000/max(1,nb_cache_hits):.3f}ms)")
+    # print(f"  Frombuffer time (misses): {total_frombuffer_miss_time*1000:.3f}ms (avg: {total_frombuffer_miss_time*1000/max(1,nb_cache_misses):.3f}ms)")
+    # print(f"  Total time: {total_time*1000:.3f}ms")
+    return result_list
+
+
+# PCA support removed: full-embedding re-scoring is no longer performed
+
+
+def _read_fasta_batch(args):
+    """Helper function for parallel FASTA reading. Must be at module level for ThreadPoolExecutor."""
+    original_fasta, match_indices_batch, index_positions = args
+    batch_data = {}
     
-    Strategy: Aggregate unique vectors across all queries first, then load them in chunks.
-    This avoids loading the same vector multiple times when multiple queries match the same centroid.
+    with open(original_fasta, "rb") as fastafile:
+        for match_idx in match_indices_batch:
+            if match_idx not in index_positions:
+                continue
+            pos = index_positions[match_idx]
+            fastafile.seek(pos)
+            
+            # Read header and sequence
+            name_line = fastafile.readline().rstrip(b'\n').decode('utf-8', errors='ignore').strip()
+            sequence_line = fastafile.readline().rstrip(b'\n').decode('utf-8', errors='ignore').strip()
+            
+            batch_data[match_idx] = (name_line, sequence_line)
+    
+    return batch_data
+
+
+def load_names_from_results(query_results, query_names, original_fasta, database_folder, parallel_threads=4):
+    """
+    Load FASTA names and sequences from results dict using sorted key access for I/O efficiency.
+    
+    Optimization: Use mmap for .names file (instant, OS pages on demand), binary mode + parallel I/O for FASTA.
     
     Args:
-        max_vectors_per_chunk (int): Maximum number of unique vectors to load per chunk (default: 1M)
+        query_results: dict mapping match_idx to list of (query_idx, distance) tuples (already sorted by match_idx)
+        query_names: list of query names indexed by query_idx
+        original_fasta: path to FASTA file
+        database_folder: path to folder containing .names file
+        parallel_threads: number of threads for parallel FASTA I/O (default 4, use 1 to disable)
+    
+    Returns:
+        list of (query_name, centroid_name, sequence, distance) tuples
     """
-    print("Filtering PCA hits using full 512-dimension embeddings to remove false positives...")
+    # parallel_threads = min(parallel_threads,4) #use at most 4 threads for reading FASTA, more threads won't help due to disk I/O limits and GIL 
+    if len(query_results) == 0:
+        return []
+    
+    # Count total results to estimate time
+    total_results = sum(len(v) for v in query_results.values())
     time_start = time.time()
     
-    if len(query_results) == 0:
-        return query_results
-        
-    if not os.path.exists(embeddings_file_path):
-        print(f"Warning: embeddings file not found at {embeddings_file_path}, skipping filtering.")
-        return [res[:4] for res in query_results]
-
-
-    # Normalize query embeddings
-    norms = np.linalg.norm(query_embeddings_full, axis=1, keepdims=True)
-    query_embeddings_full = query_embeddings_full / (norms + 1e-10)
+    names_file = os.path.join(database_folder, f"{os.path.basename(original_fasta)}.names")
     
-    # Map query names to their index
-    query_name_to_idx = {name: i for i, name in enumerate(query_names)}
+    # Step 1: Use mmap for .names file (instant, OS pages on demand)
+    mmap_start = time.time()
+    index_positions = {}
     
-    # Step 1: Collect ALL unique centroid indices across all results (deduplicate upfront)
-    unique_c_idxs = sorted(list(set([res[4] for res in query_results])))
-    num_unique_vectors = len(unique_c_idxs)
-    num_results = len(query_results)
+    with open(names_file, "rb") as nf:
+        with mmap.mmap(nf.fileno(), 0, access=mmap.ACCESS_READ) as names_mmap:
+            for match_idx in query_results.keys():
+                offset = 8 * match_idx
+                if offset + 8 <= len(names_mmap):
+                    position = int.from_bytes(names_mmap[offset:offset+8], byteorder='little', signed=False)
+                    index_positions[match_idx] = position
+                else:
+                    print("ERROR 2212: the subdatabas size is likely wrongly hardcoded" , match_idx, offset, len(names_mmap))
+                    sys.exit(1)
     
-    # Create global mapping from centroid index to its position in loaded data
-    c_idx_to_global_idx = {c_idx: i for i, c_idx in enumerate(unique_c_idxs)}
+    # print(f"Mapped {len(index_positions)} positions in {time.time() - mmap_start:.2f}s")
     
-    # Step 2: Load unique vectors in chunks
-    chunk_size = max(1, max_vectors_per_chunk)
-    num_chunks = (num_unique_vectors + chunk_size - 1) // chunk_size
-        
-    # Dictionary to store loaded embeddings: c_idx -> normalized embedding
-    loaded_embeddings = {}
+    # Step 2: Read FASTA in parallel (ThreadPoolExecutor for shared file descriptors)
+    # print(f"Reading FASTA sequences using {parallel_threads} parallel threads...")
+    fasta_read_start = time.time()
     
-    for chunk_idx in range(num_chunks):
-        start_idx = chunk_idx * chunk_size
-        end_idx = min(start_idx + chunk_size, num_unique_vectors)
-        c_idxs_chunk = unique_c_idxs[start_idx:end_idx]
-                
-        # Split the indices into sub-chunks for multiprocessing
-        load_chunk_size = max(1, len(c_idxs_chunk) // max_workers)
-        load_chunks = [c_idxs_chunk[i:i + load_chunk_size] for i in range(0, len(c_idxs_chunk), load_chunk_size)]
-        
-        # Prepare arguments for multiprocessing
-        args_list = [(embeddings_file_path, chunk) for chunk in load_chunks]
-        
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_load_embeddings_chunk, args): i for i, args in enumerate(args_list)}
+    index_to_data = {}
+    match_indices_list = list(query_results.keys())
+    
+    # Split indices into batches for parallel processing
+    batch_size = max(1, len(match_indices_list) // parallel_threads)
+    batches = [match_indices_list[i:i+batch_size] for i in range(0, len(match_indices_list), batch_size)]
+    
+    # Use ThreadPoolExecutor for I/O parallelization (threads share file descriptors efficiently)
+    with ThreadPoolExecutor(max_workers=parallel_threads) as executor:
+        futures = [
+            executor.submit(_read_fasta_batch, (original_fasta, batch, index_positions))
+            for batch in batches
+        ]
+        for future in as_completed(futures):
+            batch_data = future.result()
+            index_to_data.update(batch_data)
+    
+    # print(f"Read FASTA sequences in {time.time() - fasta_read_start:.2f}s")
+    
+    # Build final results list (iterate in sorted order)
+    final_results = []
+    results_loaded = 0
+    last_progress_count = 0
+    
+    for match_idx in query_results.keys():
+        if match_idx not in index_to_data:
+            continue
+        name_line, sequence_line = index_to_data[match_idx]
+        for query_idx, distance in query_results[match_idx]:
+            final_results.append((query_names[query_idx], name_line, sequence_line, distance))
+            results_loaded += 1
             
-            db_embeddings_list = [None] * len(load_chunks)
-            for future in as_completed(futures):
-                chunk_index = futures[future]
-                db_embeddings_list[chunk_index] = future.result()
-                
-        # Concatenate and normalize
-        db_embeddings_chunk = np.concatenate(db_embeddings_list, axis=0)
-        
-        # Normalize DB embeddings matrix using vectorized operations
-        norms_db = np.linalg.norm(db_embeddings_chunk, axis=1, keepdims=True)
-        db_embeddings_chunk = db_embeddings_chunk / (norms_db + 1e-10)
-        
-        # Store in the dictionary
-        for i, c_idx in enumerate(c_idxs_chunk):
-            loaded_embeddings[c_idx] = db_embeddings_chunk[i]
-            
-    # Step 3: Compute distances for all results using the pre-loaded embeddings
+    # print(f"Total time to load names: {time.time() - time_start:.2f} seconds")
     
-    filtered_results = []
-    for res in query_results:
-        q_name, c_name, seq, pca_dist, c_idx = res
-        q_idx = query_name_to_idx[q_name]
-        
-        # Get the pre-loaded and normalized query and centroid embeddings
-        q_emb = query_embeddings_full[q_idx]
-        c_emb = loaded_embeddings[c_idx]
-        
-        # Compute cosine distance
-        dot_product = np.sum(q_emb * c_emb)
-        cosine_distance = 1.0 - dot_product
-        
-        # Filter by cutoff
-        if cosine_distance < cutoff:
-            filtered_results.append((q_name, c_name, seq, float(cosine_distance)))
-    
-
-    print(f"Filtered results from {num_results} to {len(filtered_results)} valid hits in {time.time() - time_start:.2f} seconds.")
-    return filtered_results
+    return final_results
 
 
 def _process_centroid_result(args_tuple):
@@ -768,6 +678,7 @@ def calculate_index_threads(database_folder, db_type, max_threads, max_memory_gb
     # Use the minimum of threads limited by memory or max_threads
     index_threads = max(1, min(threads_by_memory, max_threads))
     
+    print(f"Bin file size: {bin_size_gb:.2f} GB, estimated RAM per thread: {ram_per_thread_gb:.2f} GB")
     print(f"Using {index_threads} threads for index querying based on the available memory and bin file size.")
     
     return index_threads
@@ -789,6 +700,7 @@ if __name__ == "__main__":
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
+
 
     print(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     print("search_database.py version ", __version__)
@@ -903,8 +815,8 @@ if __name__ == "__main__":
     
     print(f"Configuration: index_threads={args.index_threads}, align_threads={args.align_threads}")
     
-    cutoff = 0.25 #cosine distance cutoff
-    subdatabase_size = 10_000_000
+    cutoff = 0.2 #cosine distance cutoff
+    subdatabase_size = 100_000
     group_distance = 0 #when using 0.1, the papilloma query hit 10B proteins, which is too much
     path_to_centroid_to_prots = os.path.join(os.path.dirname(__file__), "centroid_to_prots")
 
@@ -918,25 +830,11 @@ if __name__ == "__main__":
         exit(1)
     query_embeddings = np.load(embeddings_file)
     print(f"Loaded embeddings with shape {query_embeddings.shape}")
-    
-    query_embeddings_full = query_embeddings.copy()
-    original_cutoff = cutoff
-
-    # Load and apply PCA if it exists in the database folder
-    pca, n_pca_components = load_pca_if_exists(database)
-    if pca is not None:
-        print(f"Found PCA model in database folder. Applying PCA with {n_pca_components} components...")
-        query_embeddings = apply_pca_to_query(query_embeddings, pca)
-        print(f"Query embeddings transformed to shape {query_embeddings.shape}")
-        cutoff = cutoff - 0.03 # decrease cutoff to account for PCA dimensionality reduction, which shrinks angles
-    else:
-        print("No PCA model found. Using original 512-dimensional embeddings.")
 
     #check that the embeddings are normalized, if not normalize them and print a warning
     norms = np.linalg.norm(query_embeddings, axis=1)
     if not np.allclose(norms, 1, atol=1e-3):
-        if pca is None:
-            print("Warning: Embeddings are not normalized, normalizing now...")
+        print("Warning: Embeddings are not normalized, normalizing now...")
         query_embeddings = query_embeddings / (norms[:, np.newaxis] + 1e-10)
 
     # Load query names from intermediate folder
@@ -984,17 +882,12 @@ if __name__ == "__main__":
             max_workers=args.index_threads
         )
         db_name = "FAISS"
-        
-    # filter pca hits if PCA was active
-    if pca is not None and os.path.exists(os.path.join(database, "centroids.fa.embeddings")):
-        embeddings_file_path = os.path.join(database, "centroids.fa.embeddings")
-        # filter PCA hits using the original cut-off if possible (ignoring max_dst offset or keeping it)
-        # using the original base cutoff
-        filter_cutoff = original_cutoff
-        query_results = filter_pca_hits(query_embeddings_full, query_names_full, query_results, embeddings_file_path, filter_cutoff, max_workers=args.index_threads)
-    else:
-        # Strip the c_idx element since we didn't use filter_pca_hits
-        query_results = [res[:4] for res in query_results]
+    
+    # Sort results dict by match_idx for I/O efficiency (single sort point for both filtering and name loading)
+    query_results = dict(sorted(query_results.items()))
+    
+    # Load FASTA names using sorted order from the dict (parallelized I/O)
+    query_results = load_names_from_results(query_results, query_names_full, database + "/centroids.fa", database, parallel_threads=args.align_threads)
     
     t2 = time.time()
 

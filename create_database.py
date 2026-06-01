@@ -4,6 +4,7 @@ import numpy as np
 import time
 import sys
 from sklearn.metrics.pairwise import cosine_similarity
+ 
 import random
 import argparse
 import os
@@ -12,188 +13,14 @@ import faiss
 import time
 import multiprocessing
 from usearch.index import Index
-from multiprocessing import Pool, Manager
-from functools import partial
+# Note: removed Pool/Manager imports to disable multiprocessing pools
+
 import shutil
 
 
 d = 512
 
-__version__ = "2.1.0"
-
-class UncenteredPCA:
-    """
-    Uncentered PCA using SVD-based rotation without mean subtraction.
-    This preserves cosine distances between normalized vectors better than centered PCA.
-    """
-    def __init__(self, n_components):
-        self.n_components_ = n_components
-        self.components_ = None  # Shape: (n_components, d)
-        self.singular_values_ = None
-        self.mean_ = None  # Always zero for uncentered PCA
-    
-    def fit(self, X):
-        """Fit uncentered PCA using SVD on the data directly (no centering)."""
-        # Compute SVD without centering
-        U, S, Vt = np.linalg.svd(X, full_matrices=False)
-        
-        # Store the rotation matrix from right singular vectors
-        self.components_ = Vt[:self.n_components_, :]  # Shape: (n_components, d)
-        self.singular_values_ = S[:self.n_components_]
-        self.mean_ = np.zeros(X.shape[1], dtype=np.float32)  # Zero mean for uncentered
-        return self
-    
-    def transform(self, X):
-        """Apply rotation transformation: X @ components_.T"""
-        return X @ self.components_.T
-
-
-def compute_and_save_pca(embedding_file, database_folder, n_components=64, n_samples=10_000_000):
-    """
-    Compute uncentered PCA using SVD and save the model.
-    
-    Uncentered PCA preserves cosine distances better than standard (centered) PCA.
-    
-    Args:
-        embedding_file (str): Path to the embeddings file.
-        database_folder (str): Path to folder where PCA model and stats will be saved.
-        n_components (int): Number of PCA components (default: 64).
-        n_samples (int): Number of vectors to use for PCA fitting (default: 10_000_000).
-    
-    Returns:
-        UncenteredPCA model object
-    """
-    print(f"Computing uncentered PCA with {n_components} components using {n_samples} samples...")
-    pca_folder = os.path.join(database_folder, "pca")
-    os.makedirs(pca_folder, exist_ok=True)
-    
-    bytes_per_vector = d * 2  # Each float16 is 2 bytes
-    
-    # Load first n_samples vectors
-    print(f"Loading first {n_samples} vectors from embeddings...")
-    with open(embedding_file, "rb") as ef:
-        bytes_to_read = min(n_samples * bytes_per_vector, os.path.getsize(embedding_file))
-        bytes_data = ef.read(bytes_to_read)
-        num_vectors = len(bytes_data) // bytes_per_vector
-        vectors = np.frombuffer(bytes_data, dtype=np.float16).reshape(-1, d).astype(np.float32)
-    
-    print(f"Loaded {num_vectors} vectors for PCA fitting")
-    
-    # Fit uncentered PCA using SVD
-    print(f"Fitting uncentered PCA (SVD-based)...")
-    pca = UncenteredPCA(n_components=n_components)
-    pca.fit(vectors)
-    
-    # Save PCA model components as numpy files (not as pickle for portability)
-    components_file = os.path.join(pca_folder, "components.npy")
-    singular_values_file = os.path.join(pca_folder, "singular_values.npy")
-    np.save(components_file, pca.components_)
-    np.save(singular_values_file, pca.singular_values_)
-    print(f"Uncentered PCA components saved to {components_file}")
-    
-    # Save stats
-    explained_variance_ratio = (pca.singular_values_ ** 2) / np.sum(pca.singular_values_ ** 2)
-    stats = {
-        "n_components": n_components,
-        "n_samples_used": num_vectors,
-        "pca_type": "uncentered",
-        "explained_variance_ratio": explained_variance_ratio.tolist(),
-        "cumulative_explained_variance": np.cumsum(explained_variance_ratio).tolist(),
-        "total_explained_variance": float(np.sum(explained_variance_ratio)),
-        "singular_values": pca.singular_values_.tolist(),
-    }
-    
-    import json
-    stats_file = os.path.join(pca_folder, "pca_stats.json")
-    with open(stats_file, "w") as f:
-        json.dump(stats, f, indent=2)
-    print(f"PCA stats saved to {stats_file}")
-    print(f"Explained variance ratio: {stats['total_explained_variance']:.4f}")
-    print(f"Cumulative explained variance: {stats['cumulative_explained_variance'][-1]:.4f}")
-    
-    return pca
-
-def load_pca(pca_folder):
-    """
-    Load PCA model from folder if it exists.
-    
-    Args:
-        pca_folder (str): Path to the PCA folder.
-    
-    Returns:
-        tuple: (PCA model, n_components) or (None, None) if PCA doesn't exist
-    """
-    components_file = os.path.join(pca_folder, "components.npy")
-    singular_values_file = os.path.join(pca_folder, "singular_values.npy")
-    
-    if not os.path.exists(components_file) or not os.path.exists(singular_values_file):
-        return None, None
-    
-    # Load components and singular values, reconstruct UncenteredPCA object
-    components = np.load(components_file)
-    singular_values = np.load(singular_values_file)
-    
-    n_components = components.shape[0]
-    pca = UncenteredPCA(n_components=n_components)
-    pca.components_ = components
-    pca.singular_values_ = singular_values
-    pca.mean_ = np.zeros(components.shape[1], dtype=np.float32)
-    
-    return pca, n_components
-
-def apply_pca_to_embeddings(embedding_file, database_folder, pca, n_components):
-    """
-    Transform all embeddings using PCA and save them.
-    
-    Args:
-        embedding_file (str): Path to original embeddings file.
-        database_folder (str): Path to database folder.
-        pca: Fitted PCA model.
-        n_components (int): Number of PCA components.
-    
-    Returns:
-        str: Path to the transformed embeddings file
-    """
-    print(f"Applying PCA transformation to all embeddings...")
-    
-    bytes_per_vector_original = d * 2  # Original: float16
-    bytes_per_vector_new = n_components * 2  # New: float16
-    
-    transformed_file = os.path.join(database_folder, f"{os.path.basename(embedding_file)}.pca")
-    
-    # Process file in chunks to manage memory
-    chunk_size = 100000  # vectors per chunk
-    
-    with open(embedding_file, "rb") as ef:
-        ef.seek(0, os.SEEK_END)
-        file_size = ef.tell()
-        total_vectors = file_size // bytes_per_vector_original
-        ef.seek(0)
-        
-        with open(transformed_file, "wb") as tf:
-            processed = 0
-            while processed < total_vectors:
-                # Read chunk
-                to_read = min(chunk_size, total_vectors - processed)
-                bytes_data = ef.read(to_read * bytes_per_vector_original)
-                
-                # Convert and transform
-                chunk = np.frombuffer(bytes_data, dtype=np.float16).reshape(-1, d).astype(np.float32)
-                transformed_chunk = pca.transform(chunk).astype(np.float32)
-                # Normalize after PCA to preserve unit length property
-                norms = np.linalg.norm(transformed_chunk, axis=1, keepdims=True)
-                transformed_chunk = transformed_chunk / (norms + 1e-10)
-                transformed_chunk = transformed_chunk.astype(np.float16)
-                
-                # Write transformed chunk
-                tf.write(transformed_chunk.tobytes())
-                
-                processed += to_read
-                if processed % (chunk_size * 10) == 0:
-                    print(f"Processed {processed}/{total_vectors} vectors")
-    
-    print(f"PCA-transformed embeddings saved to {transformed_file}")
-    return transformed_file
+__version__ = "2.3.0"
 
 def initialize_model_and_tokenizer(device_id):
     """
@@ -399,8 +226,8 @@ def compute_all_embeddings_parallel(input_fasta, output_folder, size_of_chunk=10
 
         # Process the selected chunks
         with open(input_fasta) as fi:
-
-            tasks = []
+            # Process each selected chunk sequentially
+            time_start_embedding = time.time()
             for chunk_id in chunks_to_process:
                 start_pos = chunk_start_positions[chunk_id]
                 end_pos = chunk_start_positions[chunk_id + 1] if chunk_id + 1 < len(chunk_start_positions) else None
@@ -415,47 +242,39 @@ def compute_all_embeddings_parallel(input_fasta, output_folder, size_of_chunk=10
                         positions_in_file.append(fi.tell() - len(line))
                     else:
                         sequences.append(line.strip())
-                tasks.append((sequences, positions_in_file, chunk_id))
 
-            # Embed sequences in parallel
-            time_start_embedding = time.time()
-            with Pool(processes=num_gpus) as pool:
-                results = pool.map(embed_glm2_parallel, [(task[0], task[2]%num_gpus) for task in tasks])
+                # Embed this chunk
+                embeddings = embed_glm2_parallel((sequences, chunk_id % max(1, num_gpus)))
 
-            # Write embeddings and update chunk status
-            for i, (embeddings, task) in enumerate(zip(results, tasks)):
-                chunk_id = task[2]
-
-                # Write embeddings and names to separate files for each chunk
+                # Write embeddings and names to separate files for this chunk
                 chunk_embedding_file = os.path.join(output_folder, f"chunk_{chunk_id*size_of_chunk}.embeddings")
                 chunk_name_file = os.path.join(output_folder, f"chunk_{chunk_id*size_of_chunk}.names")
 
-                if os.path.exists(chunk_embedding_file) and os.path.exists(chunk_name_file): #bizarre, mark the chunk as not completely done
+                if os.path.exists(chunk_embedding_file) and os.path.exists(chunk_name_file):
                     with open(chunk_already_done_file, "rb+") as cadf:
-                        fcntl.flock(cadf, fcntl.LOCK_EX)  # Lock the file
+                        fcntl.flock(cadf, fcntl.LOCK_EX)
                         cadf.seek(chunk_id)
-                        cadf.write(b'\x02')  # Update the status to 2
+                        cadf.write(b'\x02')
                         cadf.flush()
-                        fcntl.flock(cadf, fcntl.LOCK_UN)  # Unlock the file
+                        fcntl.flock(cadf, fcntl.LOCK_UN)
 
                 with open(chunk_embedding_file, "wb") as foe, open(chunk_name_file, "wb") as fon:
-                    fcntl.flock(foe, fcntl.LOCK_EX)  # Lock the embeddings file
-                    fcntl.flock(fon, fcntl.LOCK_EX)  # Lock the names file
+                    fcntl.flock(foe, fcntl.LOCK_EX)
+                    fcntl.flock(fon, fcntl.LOCK_EX)
                     for embedding in embeddings:
                         foe.write(np.array(embedding, dtype=np.float16).tobytes())
-                    for pos in task[1]:
+                    for pos in positions_in_file:
                         fon.write(np.array(pos, dtype=np.uint64).tobytes())
-
-                    fcntl.flock(foe, fcntl.LOCK_UN)  # Unlock the embeddings file
-                    fcntl.flock(fon, fcntl.LOCK_UN)  # Unlock the names file
+                    fcntl.flock(foe, fcntl.LOCK_UN)
+                    fcntl.flock(fon, fcntl.LOCK_UN)
 
                 # Mark chunk as done (1)
                 with open(chunk_already_done_file, "rb+") as cadf:
-                    fcntl.flock(cadf, fcntl.LOCK_EX)  # Lock the file
+                    fcntl.flock(cadf, fcntl.LOCK_EX)
                     cadf.seek(chunk_id)
-                    cadf.write(b'\x01')  # Update the status to 1
+                    cadf.write(b'\x01')
                     cadf.flush()
-                    fcntl.flock(cadf, fcntl.LOCK_UN)  # Unlock the file
+                    fcntl.flock(cadf, fcntl.LOCK_UN)
 
             time_end_embedding = time.time()
             print(f"Processed {len(chunks_to_process) * size_of_chunk} sequences in {time_end_embedding - time_start_embedding:.2f} seconds, or {(len(chunks_to_process) * size_of_chunk)/(time_end_embedding - time_start_embedding):.2f} sequences per seconds")
@@ -541,17 +360,19 @@ def process_subdatabase(embedding_file, bytes_per_vector, database_folder, start
         bytes_read = bytes_data[:num_vectors * bytes_per_vector]
         local_vectors = np.frombuffer(bytes_read, dtype=np.float16).reshape(-1, embedding_dimension).astype(np.float32)
 
-    #load the trained index 
+    #load the trained index
     print("loading trained index")
-    local_index_db = faiss.read_index(os.path.join(database_folder, "faiss_index_empty.bins"))
+    faiss_dir = os.path.join(database_folder, "faiss")
+    os.makedirs(faiss_dir, exist_ok=True)
+    local_index_db = faiss.read_index(os.path.join(faiss_dir, "faiss_index_empty.bins"))
 
     #fill the index
     print("Adding vectors for subdatabase ", subdatabase_id, flush=True)
     local_index_db.add(local_vectors)
     print("Vectors added", flush=True)
 
-    index_file = os.path.join(database_folder, f"faiss_index_{subdatabase_id}.bin")
-    tmp_index_file = os.path.join(database_folder, f"faiss_index_{subdatabase_id}.{os.getpid()}.tmp")
+    index_file = os.path.join(faiss_dir, f"faiss_index_{subdatabase_id}.bin")
+    tmp_index_file = os.path.join(faiss_dir, f"faiss_index_{subdatabase_id}.{os.getpid()}.tmp")
 
     # Save outside shared lock to avoid long lock holds.
     faiss.write_index(local_index_db, tmp_index_file)
@@ -578,7 +399,7 @@ def process_subdatabase(embedding_file, bytes_per_vector, database_folder, start
 
     print(f"Subdatabase {subdatabase_id} saved to {index_file}")
 
-def create_faiss_database(input_fasta, database_folder, number_of_threads=1, size_of_subdatabases=5000000, resume=False, pca_components=None):
+def create_faiss_database(input_fasta, database_folder, number_of_threads=1, size_of_subdatabases=10000000, resume=False, pca_components=None, pca_threads=4):
     
     #choice of the index based on https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index
     total_number_of_vectors = 0
@@ -587,31 +408,8 @@ def create_faiss_database(input_fasta, database_folder, number_of_threads=1, siz
     embedding_file = os.path.join(database_folder, f"{os.path.basename(input_fasta)}.embeddings")
     print("Reading from file:", embedding_file)
     
-    # Handle PCA if requested
-    pca_folder = os.path.join(database_folder, "pca")
+    # PCA support removed — always use original embeddings
     embedding_dimension = d
-    if pca_components is not None and pca_components > 0:
-        if resume:
-            # Check if PCA files already exist
-            pca_model_file = os.path.join(pca_folder, "pca_model.pkl")
-            pca_stats_file = os.path.join(pca_folder, "pca_stats.json")
-            transformed_embedding_file = os.path.join(database_folder, f"{os.path.basename(embedding_file)}.pca")
-            
-            if os.path.exists(pca_model_file) and os.path.exists(pca_stats_file) and os.path.exists(transformed_embedding_file):
-                print(f"PCA files found. Loading existing PCA model with {pca_components} components...")
-                pca, _ = load_pca(pca_folder)
-                embedding_file = transformed_embedding_file
-                embedding_dimension = pca_components
-            else:
-                print(f"PCA files not found. Computing PCA with {pca_components} components...")
-                pca = compute_and_save_pca(embedding_file, database_folder, n_components=pca_components)
-                embedding_file = apply_pca_to_embeddings(embedding_file, database_folder, pca, pca_components)
-                embedding_dimension = pca_components
-        else:
-            print(f"Applying PCA with {pca_components} components...")
-            pca = compute_and_save_pca(embedding_file, database_folder, n_components=pca_components)
-            embedding_file = apply_pca_to_embeddings(embedding_file, database_folder, pca, pca_components)
-            embedding_dimension = pca_components
     
     bytes_per_vector = embedding_dimension * 2  # Each float16 is 2 bytes
     vectors = np.empty((0, embedding_dimension), dtype=np.float32)
@@ -623,7 +421,10 @@ def create_faiss_database(input_fasta, database_folder, number_of_threads=1, siz
 
     print("number of vectors: ", total_vectors )
 
-    empty_index_file = os.path.join(database_folder, "faiss_index_empty.bins")
+    # Ensure faiss subdirectory exists and use it for index files
+    faiss_dir = os.path.join(database_folder, "faiss")
+    os.makedirs(faiss_dir, exist_ok=True)
+    empty_index_file = os.path.join(faiss_dir, "faiss_index_empty.bins")
     if not resume or not os.path.exists(empty_index_file):
         # if True : #test the flat index
         #     print("WARNING: indexing using flat index to compare the results")
@@ -655,27 +456,19 @@ def create_faiss_database(input_fasta, database_folder, number_of_threads=1, siz
     
     print("FAISS index trained and saved")
 
-    # Create tasks for each subdatabase
-    tasks = []
-    # Create a file to record which tasks (subdatabases) have already been done
+    # Create and process each subdatabase sequentially
     subdb_status_file = os.path.join(database_folder, "subdatabase_already_done.txt")
     num_subdbs = (total_vectors + size_of_subdatabases - 1) // size_of_subdatabases
-    subdb_done = [False for i in range(num_subdbs)]
     if not os.path.exists(subdb_status_file) or not resume:
         with open(subdb_status_file, "wb") as sf:
             sf.write(b'\x00' * num_subdbs)
 
-    #index
-    for subdatabase_id, start_index in enumerate(range(0, total_vectors, size_of_subdatabases)):
-        end_index = min(start_index + size_of_subdatabases, total_vectors)
-        tasks.append((embedding_file, bytes_per_vector, database_folder, start_index, end_index, subdatabase_id, subdb_status_file, embedding_dimension))
-
-    # Shuffle tasks for random processing order
-    random.shuffle(tasks)
-
-    # Process subdatabases in parallel
-    with Pool(processes=number_of_threads) as pool:
-        pool.starmap(process_subdatabase, tasks)
+    # Build list of subdatabases and process in random order
+    subdb_ranges = [(subdatabase_id, start_index, min(start_index + size_of_subdatabases, total_vectors))
+                    for subdatabase_id, start_index in enumerate(range(0, total_vectors, size_of_subdatabases))]
+    random.shuffle(subdb_ranges)
+    for subdatabase_id, start_index, end_index in subdb_ranges:
+        process_subdatabase(embedding_file, bytes_per_vector, database_folder, start_index, end_index, subdatabase_id, subdb_status_file, embedding_dimension)
 
 def process_subdatabase_usearch(embedding_file, bytes_per_vector, database_folder, start_index, end_index, subdatabase_id, file_already_done_subdatabase, embedding_dimension):
     """
@@ -722,8 +515,10 @@ def process_subdatabase_usearch(embedding_file, bytes_per_vector, database_folde
     index_db.add(vectors=local_vectors, keys=keys)
     print("Vectors added for subdatabase ", subdatabase_id, flush=True)
 
-    index_file = os.path.join(database_folder, f"usearch_index_{subdatabase_id}.bin")
-    tmp_index_file = os.path.join(database_folder, f"usearch_index_{subdatabase_id}.{os.getpid()}.tmp")
+    usearch_dir = os.path.join(database_folder, "usearch")
+    os.makedirs(usearch_dir, exist_ok=True)
+    index_file = os.path.join(usearch_dir, f"usearch_index_{subdatabase_id}.bin")
+    tmp_index_file = os.path.join(usearch_dir, f"usearch_index_{subdatabase_id}.{os.getpid()}.tmp")
 
     # Save the USEARCH index outside the shared status lock to avoid blocking all workers.
     index_db.save(tmp_index_file)
@@ -749,7 +544,7 @@ def process_subdatabase_usearch(embedding_file, bytes_per_vector, database_folde
         fcntl.flock(sf, fcntl.LOCK_UN)
     print(f"Subdatabase {subdatabase_id} saved to {index_file}")
 
-def create_usearch_database(input_fasta, database_folder, number_of_threads=1, size_of_subdatabases=5000000, resume=False, pca_components=None):
+def create_usearch_database(input_fasta, database_folder, number_of_threads=1, size_of_subdatabases=5000000, resume=False, pca_components=None, pca_threads=4):
 
     # Similar to create_faiss_database but using USEARCH instead of FAISS
     
@@ -759,31 +554,8 @@ def create_usearch_database(input_fasta, database_folder, number_of_threads=1, s
     embedding_file = os.path.join(database_folder, f"{os.path.basename(input_fasta)}.embeddings")
     print("Reading from file for usearch db creation:", embedding_file)
     
-    # Handle PCA if requested
+    # PCA support removed — always use original embeddings
     embedding_dimension = d
-    if pca_components is not None and pca_components > 0:
-        if resume:
-            # Check if PCA files already exist
-            pca_folder = os.path.join(database_folder, "pca")
-            pca_model_file = os.path.join(pca_folder, "pca_model.pkl")
-            pca_stats_file = os.path.join(pca_folder, "pca_stats.json")
-            transformed_embedding_file = os.path.join(database_folder, f"{os.path.basename(embedding_file)}.pca")
-            
-            if os.path.exists(pca_model_file) and os.path.exists(pca_stats_file) and os.path.exists(transformed_embedding_file):
-                print(f"PCA files found. Loading existing PCA model with {pca_components} components...")
-                pca, _ = load_pca(pca_folder)
-                embedding_file = transformed_embedding_file
-                embedding_dimension = pca_components
-            else:
-                print(f"PCA files not found. Computing PCA with {pca_components} components for USEARCH...")
-                pca = compute_and_save_pca(embedding_file, database_folder, n_components=pca_components)
-                embedding_file = apply_pca_to_embeddings(embedding_file, database_folder, pca, pca_components)
-                embedding_dimension = pca_components
-        else:
-            print(f"Applying PCA with {pca_components} components for USEARCH...")
-            pca = compute_and_save_pca(embedding_file, database_folder, n_components=pca_components)
-            embedding_file = apply_pca_to_embeddings(embedding_file, database_folder, pca, pca_components)
-            embedding_dimension = pca_components
     
     bytes_per_vector = embedding_dimension * 2  # Each float16 is 2 bytes
     vectors = np.empty((0, embedding_dimension), dtype=np.float32)
@@ -793,27 +565,19 @@ def create_usearch_database(input_fasta, database_folder, number_of_threads=1, s
         total_vectors = ef.tell() // bytes_per_vector
     # print("number of vectors: ", total_vectors )
 
-    # Create tasks for each subdatabase
-    tasks = []
-    # Create a file to record which tasks (subdatabases) have already been done
+    # Create and process each subdatabase sequentially
     subdb_status_file = os.path.join(database_folder, "subdatabase_usearch_already_done.txt")
     num_subdbs = (total_vectors + size_of_subdatabases - 1) // size_of_subdatabases
-    subdb_done = [False for i in range(num_subdbs)]
     if not os.path.exists(subdb_status_file) or not resume:
         with open(subdb_status_file, "wb") as sf:
             sf.write(b'\x00' * num_subdbs)
 
-    #index
-    for subdatabase_id, start_index in enumerate(range(0, total_vectors, size_of_subdatabases)):
-        end_index = min(start_index + size_of_subdatabases, total_vectors)
-        tasks.append((embedding_file, bytes_per_vector, database_folder, start_index, end_index, subdatabase_id, subdb_status_file, embedding_dimension))
-
-    # Shuffle tasks for random processing orders
-    random.shuffle(tasks)
-
-    # Process subdatabases in parallel
-    with Pool(processes=number_of_threads) as pool:
-        pool.starmap(process_subdatabase_usearch, tasks)
+    # Build list of USEARCH subdatabases and process in random order
+    subdb_ranges = [(subdatabase_id, start_index, min(start_index + size_of_subdatabases, total_vectors))
+                    for subdatabase_id, start_index in enumerate(range(0, total_vectors, size_of_subdatabases))]
+    random.shuffle(subdb_ranges)
+    for subdatabase_id, start_index, end_index in subdb_ranges:
+        process_subdatabase_usearch(embedding_file, bytes_per_vector, database_folder, start_index, end_index, subdatabase_id, subdb_status_file, embedding_dimension)
 
 
 if __name__ == "__main__":
@@ -838,7 +602,7 @@ if __name__ == "__main__":
     faiss_parser.add_argument("database_folder", type=str, help="Path to the folder containing embeddings and where FAISS DB will be saved.")
     faiss_parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss subdatabase (default: 10000000).")
     faiss_parser.add_argument("--num_cpus", type=int, default=1, help="Number of CPU threads to use for building subdatabases (default: 1).")
-    faiss_parser.add_argument("--pca_components", type=int, default=None, help="Number of PCA components to reduce dimensions to (default: None, no PCA). If specified, embeddings will be reduced to this many dimensions using PCA.")
+    # PCA support removed; kept for backward compatibility but ignored
     faiss_parser.add_argument("-F", "--force", action="store_true", help="Force overwrite of database files if desired (not applied automatically).")
     faiss_parser.add_argument("--resume", action="store_true", help="Resume the FAISS creation process if interrupted.")
 
@@ -848,7 +612,7 @@ if __name__ == "__main__":
     usearch_parser.add_argument("database_folder", type=str, help="Path to the folder containing embeddings and where USEARCH DB will be saved.")
     usearch_parser.add_argument("--subdatabases_size", type=int, default=10_000_000, help="Number of vectors in each usearch subdatabase (default: 10000000).")
     usearch_parser.add_argument("--num_cpus", type=int, default=1, help="Number of CPU threads to use for building subdatabases (default: 1).")
-    usearch_parser.add_argument("--pca_components", type=int, default=None, help="Number of PCA components to reduce dimensions to (default: None, no PCA). If specified, embeddings will be reduced to this many dimensions using PCA.")
+    # PCA support removed; kept for backward compatibility but ignored
     usearch_parser.add_argument("-F", "--force", action="store_true", help="Force overwrite of database files if desired (not applied automatically).")
     usearch_parser.add_argument("--resume", action="store_true", help="Resume the USEARCH creation process if interrupted.")
 
@@ -915,7 +679,7 @@ if __name__ == "__main__":
             number_of_threads=args.num_cpus,
             size_of_subdatabases=args.subdatabases_size,
             resume=args.resume,
-            pca_components=args.pca_components
+            # PCA support removed
         )
         end_time_faiss = time.time()
         print(f"Time taken to create FAISS database: {end_time_faiss - start_time_faiss:.2f} seconds")
@@ -931,7 +695,7 @@ if __name__ == "__main__":
             number_of_threads=args.num_cpus,
             size_of_subdatabases=args.subdatabases_size,
             resume=args.resume,
-            pca_components=args.pca_components
+            # PCA support removed
         )
         end_time_usearch = time.time()
         print(f"Time taken to create USEARCH database: {end_time_usearch - start_time_usearch:.2f} seconds")
