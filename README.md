@@ -45,52 +45,31 @@ make
 
 ## Quick Start
 
-### Step 1: Embed Query Sequences
+## Search Database
 
-Convert your query sequences into embeddings:
-
-```bash
-python embed_query.py \
-    --query_sequences queries.fasta \
-    --output results_folder \
-    -F
-```
-
-**Parameters:**
-- `--query_sequences`: Input FASTA file with query sequences
-- `--output`, `-o`: Output folder (will be created)
-- `-F`, `--force`: Force overwrite if output folder exists
-- `--force_cpu`: Force CPU usage even if GPU is available
-
-**Output structure:**
-```
-results_folder/
-├── intermediate_files/
-│   ├── query_embeddings.npy
-│   ├── query_embeddings.names.txt
-│   └── [MMseqs2 clustering files if -r used]
-```
-
-### Step 2: Search Database
-
-Search your pre-built FAISS database with the embedded queries:
+Search your pre-built database with the queries:
 
 ```bash
-python search_database.py \
-    --database /path/to/database \
-    --db-type usearch \
-    --output results_folder \
-    --query_sequences queries.fasta \
-    -t 8 \ #number of threads
-    -m 100 #available RAM (G)
+python search_database.py --help
+  -h, --help            show this help message and exit
+  --query_sequences QUERY_SEQUENCES
+                        Fasta file of queries
+  --database DATABASE   Path to the folder containing database files.
+  --output OUTPUT, -o OUTPUT
+                        Path to the output folder (created by embed_query.py if embedding step was run separately).
+  --db-type {faiss,usearch}
+                        Database type to use: faiss or usearch (default: faiss)
+  --outfmt OUTFMT       Format of the mmseqs2 output [0], default is 0 which is a tabular format with header. See mmseqs2
+                        documentation for details.
+  -m MEMORY, --memory MEMORY
+                        Maximum memory available in GB (mandatory)
+  -t NUM_THREADS, --num_threads NUM_THREADS
+                        Maximum number of threads available (mandatory)
+  --force_cpu           Force the use of CPU even if GPUs are available (for embedding step).
+  --deep-search         If enabled, extract proteins from all search results instead of only aligned centroids, then align
+                        everything with MMseqs2
+  --version             show program's version number and exit
 ```
-
-**Parameters:**
-- `--database`: Path to the FAISS database folder
-- `--output`, `-o`: Output folder (same as from embed_query.py)
-- `--query_sequences`: Original query FASTA file (for MMseqs2 alignment)
-- `-t`, `--num_threads`: Number of threads (default: 1)
-- `--outfmt`: Output format for MMseqs2 (default: '0' for tabular with header)
 
 **Output files:**
 ```
@@ -122,42 +101,16 @@ alpha      ERR11474596_7103_1      MLDWNTSSDIFVEKLLQRNYKSQSLHSQPRHRPQVDGIPYEFGYK
 SRR21885923_17279_1#87#695#-1   alpha   0.924   202     15      0       1       202     1       202     4.604E-129      393
 ```
 
-## Complete Example
-
-```bash
-# 1. Embed your queries (with GPU acceleration and query reduction)
-python embed_query.py \
-    --query_sequences my_proteins.fasta \
-    --output search_results \
-    --force_cpu \ 
-    -F
-
-# 2. Search the database
-python search_database.py \
-    --database /data/protein_database \
-    --output search_results \
-    --query_sequences my_proteins.fasta \
-    --db-type usearch \
-    -t 16 -m 100
-
-# 3. View results
-less search_results/matches.mmseqs2
-```
-
 ## Performance Tips
 
 To give an order of magnitude, searching for one protein takes 9000 CPU.s on my setup. Here are a few 
 key performance points to understand.
 
 1. **Batching queries**: The time needed to search through the database is strongly sub-linear in number of queries.
-On my system, the performance went from 9000 CPU.s for one query and 12000 CPU.s for 2000 queries.
+On my system, the performance went from 2000 CPU.s for one query and 3000 CPU.s for 2000 queries on the nonhuman database.
 
 2. **Parallel Search**: Use multiple processes for faster database search. 
-   The program is theoretically trivially parallel, but is actually limited by RAM bandwidth and hence
-   the speedup is sub-linear in the number of processes. It will automatically reduce the number of threads based on the available RAM.
-   ```bash
-   python search_database.py --database db --output results --query_sequences queries.fasta -t 10
-   ```
+Count ~200M of RAM per thread.
 
 3. **GPU Acceleration**: Use GPU for embedding 
     At embedding time, using GPU takes ~0.1s / query versus 20s / query on CPU.
@@ -172,7 +125,7 @@ On my system, the performance went from 9000 CPU.s for one query and 12000 CPU.s
 
 ### Out of memory
 
-If you encounter out of memory errors during search, reduce the number of threads with `-t` (each process requires ~3GB of RAM)
+If you encounter out of memory errors during search, reduce the number of threads with `-t` (each process requires ~200MB of RAM, but this might depend on the query)
 
 ### Problem loading the model
 The script connects to the internet to load the gLM2 model the first time it runs. Make sure you have an internet connection.
