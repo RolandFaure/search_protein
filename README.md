@@ -4,9 +4,7 @@ A fast protein sequence search tool using embedding-based similarity search with
 
 ## Overview
 
-`search_fasta` provides a two-step pipeline for searching protein databases:
-1. **Embed queries** - Convert protein sequences into embeddings using GLM2
-2. **Search database** - Find similar sequences using FAISS index and align with MMseqs2
+`search_fasta` provides a two-step python script to search throught the protein database.
 
 ## Installation
 
