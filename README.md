@@ -1,6 +1,6 @@
 # search_protein
 
-A fast protein sequence search tool using embedding-based similarity search.
+A fast protein sequence search tool using embedding-based similarity search. The tool searches for homologs of a query protein through an embedding-based search engine, and as a last steps aligns the results to the query using Mmseqs2 to provide the user sequence alignments. 
 
 ## Installation
 
@@ -52,7 +52,7 @@ python search_database.py --help
   --output OUTPUT, -o OUTPUT
                         Path to the output folder (created by embed_query.py if embedding step was run separately).
   --db-type {faiss,usearch}
-                        Database type to use: faiss or usearch (default: faiss)
+                        Database type of the database: faiss or usearch
   --outfmt OUTFMT       Format of the mmseqs2 output [0], default is 0 which is a tabular format with header. See mmseqs2
                         documentation for details.
   -m MEMORY, --memory MEMORY
