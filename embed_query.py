@@ -13,21 +13,73 @@ import tempfile
 import os
 import shutil
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 
-def embed_query_sequences(query_sequences, gpus_available=True, batch_size=20):
+def embed_query_sequences(query_file, gpus_available=True, batch_size=20, reduce_query=True, intermediate_folder=None):
     """
     Embed query sequences using GLM2 model.
     
     Args:
-        query_sequences (list of str): List of sequences to embed.
+        query_file (str): Path to the FASTA file of query sequences.
         gpus_available (bool): Whether GPUs are available.
         batch_size (int): Batch size for embedding.
+        reduce_query (bool): Whether to cluster similar proteins before embedding.
+        intermediate_folder (str): Folder used for temporary clustering files.
     
     Returns:
-        np.ndarray: Embeddings as a numpy array.
+        tuple: Embeddings as a numpy array and the query names.
     """
+    if reduce_query:
+        if intermediate_folder is None:
+            raise ValueError("intermediate_folder is required when reduce_query is enabled")
+
+        print("Clustering similar proteins with MMseqs2...")
+
+        # Run MMseqs2 easy-linclust in intermediate folder
+        cluster_prefix = os.path.join(intermediate_folder, "tmp_query_cluster")
+        
+        try:
+            subprocess.run([
+                "mmseqs", "easy-linclust",
+                query_file,
+                cluster_prefix,
+                intermediate_folder,
+                "--min-seq-id", "0.9",
+                "-c", "0.8",
+                "--cov-mode", "1"
+            ], check=True, capture_output=True, text=True)
+            
+            query_file = f"{cluster_prefix}_rep_seq.fasta"
+            print(f"Using clustered representative sequences: {query_file}")
+            
+        except subprocess.CalledProcessError as e:
+            print(f"MMseqs2 clustering failed: {e}")
+            print(f"Command: {' '.join(e.cmd)}")
+            print(f"Error output: {e.stderr}")
+            print("Proceeding without clustering")
+        except FileNotFoundError:
+            print("MMseqs2 not found. Please install MMseqs2 to use --reduce_query option.")
+            print("Proceeding without clustering")
+
+    print(f"Reading query sequences from {query_file}")
+    query_sequences = []
+    query_names = []
+    sequence_now = ""
+    with open(query_file, "r") as query_file_s:
+        for line in query_file_s:
+            if line.startswith(">"):
+                if sequence_now:
+                    query_sequences.append(sequence_now)
+                    sequence_now = ""
+                query_names.append(line.strip().lstrip('>'))
+            else:
+                sequence_now += line.strip()
+        if sequence_now:
+            query_sequences.append(sequence_now)
+
+    print(f"Found {len(query_sequences)} query sequences")
+
     print("Embedding query sequences...")
     start_time = time.time()
     
@@ -69,8 +121,18 @@ def embed_query_sequences(query_sequences, gpus_available=True, batch_size=20):
     
     elapsed_time = time.time() - start_time
     print(f"Embedding completed in {elapsed_time:.2f} seconds")
+
+    # Save embeddings in intermediate_files
+    embeddings_file = os.path.join(intermediate_folder, "query_embeddings.npy")
+    np.save(embeddings_file, query_embeddings)
+    print(f"Embeddings saved to {embeddings_file}")
     
-    return query_embeddings
+    # Save query names in intermediate_files
+    names_file = os.path.join(intermediate_folder, "query_embeddings.names.txt")
+    with open(names_file, 'w') as f:
+        for name in query_names:
+            f.write(f"{name}\n")
+    print(f"Query names saved to {names_file}")
 
 
 if __name__ == "__main__":
@@ -80,13 +142,12 @@ if __name__ == "__main__":
     parser.add_argument("-F", "--force", action="store_true", help="Force cleaning the output folder if it exists")
     parser.add_argument("--force_cpu", action="store_true", help="Force the use of CPU even if GPUs are available.")
     # parser.add_argument("--batch_size", type=int, default=10, help="Batch size for embedding.")
-    # parser.add_argument("-r","--reduce_query", action="store_true", help="Cluster similar proteins to reduce embedding time (identity > 0.9)")
+    parser.add_argument("-r","--do_not_reduce_query", action="store_true", help="Do not cluster similar proteins to reduce time (identity > 0.9)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     
     args = parser.parse_args()
     batch_size = 10
-    # reduce_query = True
-    reduce_query = False
+    reduce_query = not args.do_not_reduce_query
     
     # Handle output folder creation/cleanup
     output_folder = args.output.rstrip("/")
@@ -120,78 +181,14 @@ if __name__ == "__main__":
         gpus_available = False
         print("Forced CPU mode")
     
-    # Read all sequences from the query FASTA file
-    query_sequences = []
-    query_names = []
-    sequence_now = ""
-    query_file = args.query_sequences
-
-    if reduce_query:
-            
-        print("Clustering similar proteins with MMseqs2...")
-        
-
-        # Run MMseqs2 easy-linclust in intermediate folder
-        cluster_prefix = os.path.join(intermediate_folder, "tmp_query_cluster")
-        rep_fasta = os.path.join(intermediate_folder, "tmp_cluster_rep_seq.fasta")
-        
-        try:
-            subprocess.run([
-                "mmseqs", "easy-linclust",
-                query_file,
-                cluster_prefix,
-                intermediate_folder,
-                "--min-seq-id", "0.9",
-                "-c", "0.8",
-                "--cov-mode", "1"
-            ], check=True, capture_output=True, text=True)
-            
-            # Use the representative sequences file as the query file
-            query_file = f"{cluster_prefix}_rep_seq.fasta"
-            print(f"Using clustered representative sequences: {query_file}")
-            
-        except subprocess.CalledProcessError as e:
-            print(f"MMseqs2 clustering failed: {e}")
-            print(f"Command: {' '.join(e.cmd)}")
-            print(f"Error output: {e.stderr}")
-            print("Proceeding without clustering")
-        except FileNotFoundError:
-            print("MMseqs2 not found. Please install MMseqs2 to use --reduce_query option.")
-            print("Proceeding without clustering")
-    
-    print(f"Reading query sequences from {args.query_sequences}")
-    with open(query_file, "r") as query_file_s:
-        for line in query_file_s:
-            if line.startswith(">"):
-                if sequence_now:
-                    query_sequences.append(sequence_now)
-                    sequence_now = ""
-                query_names.append(line.strip().lstrip('>'))
-            else:
-                sequence_now += line.strip()
-        if sequence_now:
-            query_sequences.append(sequence_now)
-    
-    print(f"Found {len(query_sequences)} query sequences")
-    
     # Embed the sequences
-    query_embeddings = embed_query_sequences(
-        query_sequences=query_sequences,
+    embed_query_sequences(
+        query_file=args.query_sequences,
         gpus_available=gpus_available,
-        batch_size=batch_size
+        batch_size=batch_size,
+        reduce_query=reduce_query,
+        intermediate_folder=intermediate_folder
     )
-    
-    # Save embeddings in intermediate_files
-    embeddings_file = os.path.join(intermediate_folder, "query_embeddings.npy")
-    np.save(embeddings_file, query_embeddings)
-    print(f"Embeddings saved to {embeddings_file}")
-    
-    # Save query names in intermediate_files
-    names_file = os.path.join(intermediate_folder, "query_embeddings.names.txt")
-    with open(names_file, 'w') as f:
-        for name in query_names:
-            f.write(f"{name}\n")
-    print(f"Query names saved to {names_file}")
 
     
     # Clean up temporary files from MMseqs2 clustering (already in intermediate_folder, no action needed)

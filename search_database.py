@@ -14,13 +14,99 @@ import sys
 import tempfile
 import subprocess
 import mmap
+import shutil
 from sklearn.metrics.pairwise import cosine_distances
 from usearch.index import Index,search, MetricKind, BatchMatches
 import datetime
 
-__version__ = "2.8.0"
+__version__ = "2.10.0"
 
-def query_bin(bin_file, original_fasta, database_folder, query_embeddings, query_names, subdatabase_size, cutoff):
+WORKER_QUERY_EMBEDDINGS = None
+
+
+def _init_search_worker(query_embeddings):
+    global WORKER_QUERY_EMBEDDINGS
+    WORKER_QUERY_EMBEDDINGS = query_embeddings
+
+
+def _cat_files(input_files, output_file):
+    """Concatenate files on disk into a single output file.
+
+    Uses batched cat calls to avoid hitting OS ARG_MAX with very large file lists.
+    """
+    batch_size = 1000
+    with open(output_file, "wb") as out_f:
+        if input_files:
+            for i in range(0, len(input_files), batch_size):
+                batch = input_files[i:i + batch_size]
+                subprocess.run(["cat", *batch], check=True, stdout=out_f)
+        else:
+            out_f.truncate(0)
+
+
+def _sort_tsv_on_disk(input_file, output_file, key_specs, parallel_threads=1):
+    """Sort a TSV file on disk using GNU sort."""
+    sort_cmd = ["sort", "-T", os.path.dirname(output_file) or "."]
+    if parallel_threads and parallel_threads > 1:
+        sort_cmd.extend(["--parallel", str(parallel_threads)])
+    sort_cmd.extend(["-t", "\t"])
+    for field_number, modifier in key_specs:
+        sort_cmd.append(f"-k{field_number},{field_number}{modifier}")
+    sort_cmd.extend([input_file, "-o", output_file])
+    subprocess.run(sort_cmd, check=True)
+
+
+def _write_results_fasta_from_tsv(tsv_file, fasta_file):
+    """Stream a TSV file and write the corresponding FASTA file."""
+    with open(tsv_file, "r") as in_f, open(fasta_file, "w") as out_f:
+        for line in in_f:
+            if not line or line.startswith("#"):
+                continue
+            query_name, centroid_name, sequence, _distance = line.rstrip("\n").split("\t", 3)
+            out_f.write(f"{centroid_name}#{query_name}\n{sequence}\n")
+
+
+def _write_unique_centroids_from_tsv(tsv_file, fasta_file):
+    """Create a deduplicated centroid FASTA from a TSV file sorted by centroid columns."""
+    with open(tsv_file, "r") as in_f, open(fasta_file, "w") as out_f:
+        last_pair = None
+        for line in in_f:
+            if not line or line.startswith("#"):
+                continue
+            _query_name, centroid_name, sequence, _distance = line.rstrip("\n").split("\t", 3)
+            pair = (centroid_name, sequence)
+            if pair == last_pair:
+                continue
+            last_pair = pair
+            out_f.write(f"{centroid_name}\n{sequence}\n")
+
+
+def _load_filtered_results_from_tsv(tsv_file, matched_centroid_ids):
+    """Load only rows whose centroid is in matched_centroid_ids."""
+    filtered_query_results = []
+    with open(tsv_file, "r") as in_f:
+        for line in in_f:
+            if not line or line.startswith("#"):
+                continue
+            query_name, centroid_name, sequence, distance_str = line.rstrip("\n").split("\t", 3)
+            centroid_id = centroid_name.strip()[1:].split()[0]
+            if centroid_id in matched_centroid_ids:
+                filtered_query_results.append((query_name, centroid_name, sequence, float(distance_str)))
+    return filtered_query_results
+
+
+def _load_all_results_from_tsv(tsv_file):
+    """Load every row from a named TSV into RAM."""
+    all_results = []
+    with open(tsv_file, "r") as in_f:
+        for line in in_f:
+            if not line.strip():
+                continue
+            query_name, centroid_name, sequence, distance_str = line.rstrip("\n").split("\t", 3)
+            all_results.append((query_name, centroid_name, sequence, float(distance_str)))
+    return all_results
+
+def query_bin(bin_file, original_fasta, database_folder, subdatabase_size, cutoff, tmp_results_dir):
     start_time = time.time()
     faiss.omp_set_num_threads(1)
 
@@ -29,26 +115,34 @@ def query_bin(bin_file, original_fasta, database_folder, query_embeddings, query
     index = faiss.read_index(index_path)
     nb_of_searches = 1
     distances = []
+    query_embeddings = WORKER_QUERY_EMBEDDINGS
     while len(distances) == 0 or (distances[0][-1] < cutoff and nb_of_searches <= 10):
         k = 20 * 2 ** (nb_of_searches)
         distances, indices = index.search(query_embeddings, k=k)
         nb_of_searches += 1
 
-    # Organize results: match_idx -> [(query_idx, distance), ...]
-    matches_to_queries = {}
+    hits_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        delete=False,
+        dir=tmp_results_dir,
+        prefix=f"{bin_file}.",
+        suffix=".hits.tsv",
+    )
+    distinct_matches = set()
     for query_idx, (dist_row, idx_row) in enumerate(zip(distances, indices)):
         for dist, idx in zip(dist_row, idx_row):
             if dist < cutoff:
                 match_idx = int(file_starting_pos + idx)
-                if match_idx not in matches_to_queries:
-                    matches_to_queries[match_idx] = []
-                matches_to_queries[match_idx].append((query_idx, dist))
+                distinct_matches.add(match_idx)
+                hits_file.write(f"{match_idx}\t{query_idx}\t{dist}\n")
 
-    print(f"Total distinct matches for bin {bin_file}: {len(matches_to_queries)}")
+    hits_file.close()
+
+    print(f"Total distinct matches for bin {bin_file}: {len(distinct_matches)}")
     
     elapsed_time = time.time() - start_time
     print(f"Time taken for querying bin {bin_file}: {elapsed_time:.2f} seconds")
-    return matches_to_queries
+    return hits_file.name
 
 def search_faiss_database(original_fasta, database_folder, query_embeddings, query_names, cutoff=0.2, subdatabase_size=10000000, max_workers=4):
     """
@@ -71,23 +165,27 @@ def search_faiss_database(original_fasta, database_folder, query_embeddings, que
     faiss_database_folder = database_folder+"/faiss"
     bin_files = [file for file in os.listdir(faiss_database_folder) if file.endswith(".bin")]
 
-    all_results = {}
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    tmp_results_dir = tempfile.mkdtemp(prefix="faiss_hits_", dir=database_folder)
+    bin_result_files = []
+    with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_search_worker, initargs=(query_embeddings,)) as executor:
         futures = [
-            executor.submit(query_bin, bin_file, original_fasta, faiss_database_folder, query_embeddings, query_names, subdatabase_size, cutoff) for bin_file in bin_files
+            executor.submit(query_bin, bin_file, original_fasta, faiss_database_folder, subdatabase_size, cutoff, tmp_results_dir) for bin_file in bin_files
         ]
         for future in as_completed(futures):
-            bin_results = future.result()
-            # Merge bin_results dict into all_results
-            for match_idx, query_hits in bin_results.items():
-                if match_idx not in all_results:
-                    all_results[match_idx] = []
-                all_results[match_idx].extend(query_hits)
+            bin_result_files.append(future.result())
 
-    return all_results
+    merged_hits_file = os.path.join(tmp_results_dir, "all_hits.tsv")
+    _cat_files(bin_result_files, merged_hits_file)
+    for path in bin_result_files:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+    return merged_hits_file
 
 
-def query_usearch_bin(bin_file, original_fasta, database_folder, query_embeddings, query_names, subdatabase_size, cutoff):
+def query_usearch_bin(bin_file, original_fasta, database_folder, subdatabase_size, cutoff, tmp_results_dir):
     """Query a single usearch index file and return results as dict: match_idx -> [(query_idx, distance), ...]"""
     start_time = time.time()
 
@@ -101,6 +199,7 @@ def query_usearch_bin(bin_file, original_fasta, database_folder, query_embedding
     # Search with increasing k until we get results beyond the cutoff
     nb_of_searches = 1
     all_matches = None
+    query_embeddings = WORKER_QUERY_EMBEDDINGS
     while nb_of_searches <= 10:
         k = 2000 * 2 ** nb_of_searches
         matches : BatchMatches = index.search(query_embeddings, k, exact=False)
@@ -123,23 +222,30 @@ def query_usearch_bin(bin_file, original_fasta, database_folder, query_embedding
     if all_matches is None:
         return {}
 
-    # Organize results: match_idx -> [(query_idx, distance), ...]
-    matches_to_queries = {}
+    hits_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        delete=False,
+        dir=tmp_results_dir,
+        prefix=f"{bin_file}.",
+        suffix=".hits.tsv",
+    )
+    distinct_matches = set()
     for query_idx in range(len(all_matches)):
         for j in range(len(all_matches[query_idx])):
             dist = all_matches[query_idx][j].distance
             if dist < cutoff:
                 key = all_matches[query_idx][j].key
                 match_idx = int(file_starting_pos + key)
-                if match_idx not in matches_to_queries:
-                    matches_to_queries[match_idx] = []
-                matches_to_queries[match_idx].append((query_idx, dist))
+                distinct_matches.add(match_idx)
+                hits_file.write(f"{match_idx}\t{query_idx}\t{dist}\n")
 
-    print(f"Total distinct matches for bin {bin_file}: {len(matches_to_queries)}")
+    hits_file.close()
+
+    print(f"Total distinct matches for bin {bin_file}: {len(distinct_matches)}")
     
     elapsed_time = time.time() - start_time
     print(f"Time taken for querying bin {bin_file}: {elapsed_time:.2f} seconds")
-    return matches_to_queries
+    return hits_file.name
 
 def search_usearch_database(original_fasta, database_folder, query_embeddings, query_names, cutoff=0.2, subdatabase_size=10000000, max_workers=4):
     """
@@ -167,20 +273,26 @@ def search_usearch_database(original_fasta, database_folder, query_embeddings, q
     # bin_files = bin_files[bin_file_random:bin_file_random+100]
     # print("DEBUUUUUGUGkkk")
 
-    all_results = {}
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    tmp_results_dir = tempfile.mkdtemp(prefix="usearch_hits_", dir=database_folder)
+    bin_result_files = []
+    with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_search_worker, initargs=(query_embeddings,)) as executor:
         futures = [
-            executor.submit(query_usearch_bin, bin_file, original_fasta, usearch_database_folder, query_embeddings, query_names, subdatabase_size, cutoff) 
+            executor.submit(query_usearch_bin, bin_file, original_fasta, usearch_database_folder, subdatabase_size, cutoff, tmp_results_dir)
             for bin_file in bin_files
         ]
         for future in as_completed(futures):
-            bin_results = future.result()
-            # Merge bin_results dict into all_results
-            for match_idx, query_hits in bin_results.items():
-                if match_idx not in all_results:
-                    all_results[match_idx] = []
-                all_results[match_idx].extend(query_hits)
-    return all_results
+            bin_result_files.append(future.result())
+
+    time1 = time.time()
+    merged_hits_file = os.path.join(tmp_results_dir, "all_hits.tsv")
+    _cat_files(bin_result_files, merged_hits_file)
+    for path in bin_result_files:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    print(f"Time for concatenating all results : {time.time() - time1:.2f} seconds")
+    return merged_hits_file
 
 
 def _read_embedding_batch(args):
@@ -350,6 +462,67 @@ def load_names_from_results(query_results, query_names, original_fasta, database
     # print(f"Total time to load names: {time.time() - time_start:.2f} seconds")
     
     return final_results
+
+
+def load_names_from_hits_file(hits_file, query_names, original_fasta, database_folder, parallel_threads=4, output_tsv=None):
+    """Load FASTA names and sequences from a sorted hits TSV and write a named TSV on disk."""
+    if output_tsv is None:
+        output_tsv = os.path.join(os.path.dirname(hits_file), "query_results_named.tsv")
+
+    if len(query_names) == 0:
+        with open(output_tsv, "w") as out_f:
+            pass
+        return output_tsv
+
+    names_file = os.path.join(database_folder, f"{os.path.basename(original_fasta)}.names")
+
+    unique_match_indices = []
+    last_match_idx = None
+    with open(hits_file, "r") as in_f:
+        for line in in_f:
+            if not line.strip():
+                continue
+            match_idx = int(line.split("\t", 1)[0])
+            if match_idx != last_match_idx:
+                unique_match_indices.append(match_idx)
+                last_match_idx = match_idx
+
+    index_positions = {}
+    with open(names_file, "rb") as nf:
+        with mmap.mmap(nf.fileno(), 0, access=mmap.ACCESS_READ) as names_mmap:
+            for match_idx in unique_match_indices:
+                offset = 8 * match_idx
+                if offset + 8 <= len(names_mmap):
+                    position = int.from_bytes(names_mmap[offset:offset+8], byteorder='little', signed=False)
+                    index_positions[match_idx] = position
+                else:
+                    print("ERROR 2212: the subdatabas size is likely wrongly hardcoded", match_idx, offset, len(names_mmap))
+                    sys.exit(1)
+
+    index_to_data = {}
+    match_indices_list = unique_match_indices
+    batch_size = max(1, len(match_indices_list) // max(1, parallel_threads))
+    batches = [match_indices_list[i:i+batch_size] for i in range(0, len(match_indices_list), batch_size)]
+
+    with ThreadPoolExecutor(max_workers=parallel_threads) as executor:
+        futures = [executor.submit(_read_fasta_batch, (original_fasta, batch, index_positions)) for batch in batches]
+        for future in as_completed(futures):
+            batch_data = future.result()
+            index_to_data.update(batch_data)
+
+    with open(hits_file, "r") as in_f, open(output_tsv, "w") as out_f:
+        for line in in_f:
+            if not line.strip():
+                continue
+            match_idx_str, query_idx_str, distance_str = line.rstrip("\n").split("\t", 2)
+            match_idx = int(match_idx_str)
+            query_idx = int(query_idx_str)
+            if match_idx not in index_to_data:
+                continue
+            name_line, sequence_line = index_to_data[match_idx]
+            out_f.write(f"{query_names[query_idx]}\t{name_line}\t{sequence_line}\t{distance_str}\n")
+
+    return output_tsv
 
 
 def _process_centroid_result(args_tuple):
@@ -606,7 +779,7 @@ def align_centroids_with_mmseqs2(unique_fasta, query_fasta, num_threads, interme
             ], check=True, stdout=lfs, stderr=subprocess.STDOUT)
 
         # Convert results to tabular formatG
-        result_tsv = os.path.join(tmpdir, "result.tsv")
+        result_tsv = os.path.join(intermediate_folder, "result.tsv")
         with open(log_file_convertalis, "w") as lfc:
             subprocess.run([
                 "mmseqs", "convertalis", centroid_mmseqs, query_mmseqs, result_mmseqs, result_tsv,
@@ -663,7 +836,7 @@ def calculate_index_threads(database_folder, db_type, max_threads, max_memory_gb
     bin_size_gb = bin_size_bytes / (1024 ** 3)
     
     # RAM needed per thread is empirically: bin_size * 3
-    ram_per_thread_gb = bin_size_gb * 3
+    ram_per_thread_gb = bin_size_gb * 6
     
     if ram_per_thread_gb <= 0:
         print("Warning: Bin file is empty or too small. Defaulting to 1 thread.")
@@ -692,6 +865,7 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--num_threads", type=int, required=True, help="Maximum number of threads available (mandatory)")
     parser.add_argument("--force_cpu", action="store_true", help="Force the use of CPU even if GPUs are available (for embedding step).")
     parser.add_argument("--deep-search", action="store_true", help="If enabled, extract proteins from all search results instead of only aligned centroids, then align everything with MMseqs2")
+    parser.add_argument("-r","--do_not_reduce_query", action="store_true", help="Do not cluster similar proteins to reduce time (identity > 0.9)")
     #parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss database")
     #parser.add_argument("--cutoff", type=float, default=0.2, help="Distance cutoff for results")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -707,10 +881,11 @@ if __name__ == "__main__":
     output_folder = args.output.rstrip("/")
     intermediate_folder = os.path.join(output_folder, "intermediate_files")
     embeddings_file = os.path.join(intermediate_folder, "query_embeddings.npy")
+
+    reduce_query = not args.do_not_reduce_query
     
     # Check if embeddings need to be created
     embeddings_exist = os.path.exists(embeddings_file)
-    
     if not embeddings_exist:
         # Embeddings don't exist - we need to create them
         if not args.query_sequences:
@@ -747,47 +922,19 @@ if __name__ == "__main__":
             gpus_available = False
             print("Forced CPU mode for embedding")
         
-        # Read query sequences from FASTA file
-        query_sequences = []
-        query_names = []
-        sequence_now = ""
-        
-        print(f"Reading query sequences from {args.query_sequences}")
-        with open(args.query_sequences, "r") as query_file_s:
-            for line in query_file_s:
-                if line.startswith(">"):
-                    if sequence_now:
-                        query_sequences.append(sequence_now)
-                        sequence_now = ""
-                    query_names.append(line.strip().lstrip('>'))
-                else:
-                    sequence_now += line.strip()
-            if sequence_now:
-                query_sequences.append(sequence_now)
-        
-        print(f"Found {len(query_sequences)} query sequences")
-        
         # Create intermediate_files folder
         os.makedirs(intermediate_folder, exist_ok=True)
         
         # Embed the sequences
         batch_size = 10
-        query_embeddings = embed_query_sequences(
-            query_sequences=query_sequences,
+        embed_query_sequences(
+            query_file=args.query_sequences,
             gpus_available=gpus_available,
-            batch_size=batch_size
+            batch_size=batch_size,
+            reduce_query=reduce_query,
+            intermediate_folder=intermediate_folder
         )
         
-        # Save embeddings
-        np.save(embeddings_file, query_embeddings)
-        print(f"Embeddings saved to {embeddings_file}")
-        
-        # Save query names
-        names_file = os.path.join(intermediate_folder, "query_embeddings.names.txt")
-        with open(names_file, 'w') as f:
-            for name in query_names:
-                f.write(f"{name}\n")
-        print(f"Query names saved to {names_file}")
     else:
         print(f"Found existing embeddings in {output_folder}")
     
@@ -812,7 +959,7 @@ if __name__ == "__main__":
     
     print(f"Configuration: index_threads={args.index_threads}, align_threads={args.align_threads}")
     
-    cutoff = 0.25 #cosine distance cutoff
+    cutoff = 0.2 #cosine distance cutoff
     subdatabase_size = 100_000
     group_distance = 0 #when using 0.1, the papilloma query hit 10B proteins, which is too much
     path_to_centroid_to_prots = os.path.join(os.path.dirname(__file__), "centroid_to_prots")
@@ -854,7 +1001,7 @@ if __name__ == "__main__":
     
     # Choose database type
     if args.db_type == 'usearch':
-        query_results = search_usearch_database(
+        raw_hits_file = search_usearch_database(
             original_fasta=database+"/centroids.fa",
             database_folder=database,
             query_embeddings=query_embeddings,
@@ -869,7 +1016,7 @@ if __name__ == "__main__":
     else:  # faiss
         cutoff = cutoff * 2  # convert cosine distance to L2² (FAISS Flat index returns squared L2 distance)
         print("the new cutoff for FAISS search is ", cutoff)
-        query_results = search_faiss_database(
+        raw_hits_file = search_faiss_database(
             original_fasta=database+"/centroids.fa",
             database_folder=database,
             query_embeddings=query_embeddings,
@@ -879,48 +1026,49 @@ if __name__ == "__main__":
             max_workers=args.index_threads
         )
         db_name = "FAISS"
-    
-    # Sort results dict by match_idx for I/O efficiency (single sort point for both filtering and name loading)
-    query_results = dict(sorted(query_results.items()))
-    
-    # Load FASTA names using sorted order from the dict (parallelized I/O)
-    query_results = load_names_from_results(query_results, query_names_full, database + "/centroids.fa", database, parallel_threads=args.align_threads)
+
+    # Sort hits on disk by match index, then stream names and sequences into a TSV.
+    sorted_hits_file = os.path.join(intermediate_folder, "query_results_hits_sorted.tsv")
+    _sort_tsv_on_disk(raw_hits_file, sorted_hits_file, [(1, "n")], parallel_threads=args.index_threads)
+
+    named_results_tsv = os.path.join(intermediate_folder, "query_results_named.tsv")
+    load_names_from_hits_file(
+        sorted_hits_file,
+        query_names_full,
+        database + "/centroids.fa",
+        database,
+        parallel_threads=args.align_threads,
+        output_tsv=named_results_tsv,
+    )
+
+    # Sort the named results on disk by query name and distance
+    sorted_named_results_tsv = os.path.join(intermediate_folder, "query_results_sorted.tsv")
+    _sort_tsv_on_disk(named_results_tsv, sorted_named_results_tsv, [(1, ""), (4, "g")], parallel_threads=args.align_threads)
+
+    total_named_results = 0
+    with open(sorted_named_results_tsv, "r") as count_f:
+        for _ in count_f:
+            total_named_results += 1
     
     t2 = time.time()
 
-    if len(query_results) == 0:
+    if total_named_results == 0:
         print("No results, exiting")
         print(f"Total time: {t2 - t1:.2f} seconds")
         sys.exit(0)
 
-    # Sort results by query index and then by ascending distance
-    query_results.sort(key=lambda x: (x[0], x[3]))
-
     # Output query_results as an intermediate FASTA file in intermediate_files
     intermediate_fasta = os.path.join(intermediate_folder, "query_results_intermediate.fasta")
-    with open(intermediate_fasta, "w") as fasta_file:
-        for query_name, centroid_name, sequence, distance in query_results:
-            fasta_file.write(f"{centroid_name}#{query_name.strip()}\n{sequence}\n")
+    _write_results_fasta_from_tsv(sorted_named_results_tsv, intermediate_fasta)
     # print(f"Intermediate FASTA file written: {intermediate_fasta}")
     # print("EXITITNG NOW TO CHECK INTERMEDIATE FILES, COMMENT THIS EXIT TO RUN THE WHOLE PIPELINE")
     # sys.exit(0)
 
-    # Output TSV file in intermediate_files
-    tsv_output = os.path.join(intermediate_folder, "query_results.tsv")
-    with open(tsv_output, "w") as tsvfile:
-        tsvfile.write("#query_name\tresult_name\tresult_sequences\tcosine_distance\n")
-        for query_name, centroid_name, sequence, distance in query_results:
-            tsvfile.write(f"{query_name.strip()}\t{centroid_name.strip()[1:].split()[0]}\t{sequence}\t{distance}\n")
-    print(f"TSV file written: {tsv_output}")
-
     # Write a deduplicated intermediate FASTA file in intermediate_files (unique centroid name/seq pairs)
     unique_fasta = os.path.join(intermediate_folder, "unique_centroids.fasta")
-    unique_centroids = set()
-    for _, centroid_name, sequence, _ in query_results:
-        unique_centroids.add((centroid_name, sequence))
-    with open(unique_fasta, "w") as fasta_file:
-        for centroid_name, sequence in unique_centroids:
-            fasta_file.write(f"{centroid_name}\n{sequence}\n")
+    unique_sorted_tsv = os.path.join(intermediate_folder, "unique_centroids_sorted.tsv")
+    _sort_tsv_on_disk(named_results_tsv, unique_sorted_tsv, [(2, ""), (3, "")], parallel_threads=args.align_threads)
+    _write_unique_centroids_from_tsv(unique_sorted_tsv, unique_fasta)
     print(f"Unique centroid FASTA file written: {unique_fasta}")
 
     # Align centroids against query using MMseqs2 to filter results
@@ -935,30 +1083,30 @@ if __name__ == "__main__":
         # Remove '>' if present and get the first word
         clean_id = centroid_id.lstrip(">").split()[0]
         matched_centroid_ids.add(clean_id)
-
-    filtered_query_results = []
     
     if args.deep_search:
         # Deep search: use all query results without alignment filtering
         print("Using deep-search mode: extracting proteins from ALL search results (no alignment filtering)")
-        filtered_query_results = query_results
+        filtered_query_results = _load_all_results_from_tsv(sorted_named_results_tsv)
     else:
         # Normal mode: filter to only aligned centroids
-        for query_name, centroid_name, sequence, distance in query_results:
-            # Extract centroid ID from centroid_name for comparison
-            centroid_id = centroid_name.strip()[1:].split()[0]  # Remove '>' and take first word
-            if centroid_id in matched_centroid_ids:
-                filtered_query_results.append((query_name, centroid_name, sequence, distance))
+        filtered_query_results = _load_filtered_results_from_tsv(sorted_named_results_tsv, matched_centroid_ids)
 
-    print(f"Filtered results: {len(filtered_query_results)} results from {len(query_results)} (kept centroids alignable with query)" if not args.deep_search else f"Deep-search mode: processing all {len(filtered_query_results)} search results")
+    print(f"Filtered results: {len(filtered_query_results)} results from {total_named_results} (kept centroids alignable with query)" if not args.deep_search else f"Deep-search mode: processing all {len(filtered_query_results)} search results")
 
     # Output all query results as diversified_hits.tsv (main output file) - includes all centroids for user research
     diversified_hits_file = os.path.join(output_folder, "diversified_hits.tsv")
-    with open(diversified_hits_file, "w") as tsvfile:
-        tsvfile.write("#query_name\tresult_name\tresult_sequences\tcosine_distance\n")
-        for query_name, centroid_name, sequence, distance in query_results:
-            tsvfile.write(f"{query_name.strip()}\t{centroid_name.strip()[1:].split()[0]}\t{sequence}\t{distance}\n")
+    with open(diversified_hits_file, "w") as out_f:
+        out_f.write("#query_name\tresult_name\tresult_sequences\tcosine_distance\n")
+        with open(sorted_named_results_tsv, "r") as in_f:
+            shutil.copyfileobj(in_f, out_f)
     print(f"Diversified hits TSV file written: {diversified_hits_file}")
+
+    for temp_path in [raw_hits_file, sorted_hits_file, named_results_tsv, sorted_named_results_tsv, unique_sorted_tsv]:
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
 
     t3 = time.time()
 
