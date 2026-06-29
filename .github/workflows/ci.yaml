@@ -1,0 +1,54 @@
+name: Smoke test 
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: "3.10"
+          activate-environment: search_fasta
+          auto-activate-base: false
+
+      - name: Cache conda environment
+        uses: actions/cache@v4
+        id: cache-conda
+        with:
+          path: ${{ env.CONDA }}/envs/search_fasta
+          key: conda-${{ runner.os }}-${{ hashFiles('**/README.md') }}
+
+      - name: Install conda dependencies
+        if: steps.cache-conda.outputs.cache-hit != 'true'
+        shell: bash -el {0}
+        run: |
+          conda install -y \
+            -c pytorch -c nvidia -c conda-forge -c bioconda \
+            python=3.10 mmseqs2 "pytorch>=2.5" pytorch-cuda=12.1 \
+            "faiss-cpu>=1.8" numpy scikit-learn transformers einops
+
+      - name: Install pip dependencies
+        if: steps.cache-conda.outputs.cache-hit != 'true'
+        shell: bash -el {0}
+        run: pip install usearch
+
+      - name: Install system build dependencies
+        run: sudo apt-get install -y libzstd-dev
+
+      - name: Compile C++ scripts
+        shell: bash -el {0}
+        run: make
+
+      - name: Smoke test - search_database.py --help
+        shell: bash -el {0}
+        run: python search_database.py --help
