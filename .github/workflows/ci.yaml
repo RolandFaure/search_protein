@@ -46,7 +46,7 @@ jobs:
         run: sudo apt-get install -y libzstd-dev
 
       - name: Patch missing cstdint include
-        run: sed -i '/#include <sstream>/a #include <cstdint>' centroid_to_prots.cpp
+        run: sed -i $'/#include <sstream>/a\\\n#include <cstdint>' centroid_to_prots.cpp
 
       - name: Compile C++ scripts
         shell: bash -el {0}
