@@ -35,7 +35,7 @@ jobs:
           mamba install -y \
             -c pytorch -c nvidia -c conda-forge -c bioconda \
             python=3.10 mmseqs2 "pytorch>=2.5" pytorch-cuda=12.1 \
-            "faiss-cpu>=1.8" numpy scikit-learn transformers einops
+            "faiss-cpu>=1.8=*openblas*" numpy scikit-learn transformers einops
 
       - name: Install pip dependencies
         if: steps.cache-conda.outputs.cache-hit != 'true'
