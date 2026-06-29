@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Miniforge
         uses: conda-incubator/setup-miniconda@v3.1.0
@@ -22,7 +22,7 @@ jobs:
           auto-activate-base: false
 
       - name: Cache conda environment
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         id: cache-conda
         with:
           path: ${{ env.CONDA }}/envs/search_fasta
@@ -52,6 +52,10 @@ jobs:
       - name: Compile C++ scripts
         shell: bash -el {0}
         run: make
+
+      - name: Smoke test - embed_query.py --help
+        shell: bash -el {0}
+        run: python embed_query.py --help
 
       - name: Smoke test - search_database.py --help
         shell: bash -el {0}
