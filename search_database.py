@@ -19,7 +19,7 @@ from sklearn.metrics.pairwise import cosine_distances
 from usearch.index import Index,search, MetricKind, BatchMatches
 import datetime
 
-__version__ = "2.11.0"
+__version__ = "2.11.1"
 
 WORKER_QUERY_EMBEDDINGS = None
 
@@ -521,8 +521,7 @@ def load_names_from_hits_file(hits_file, query_names, original_fasta, database_f
             if match_idx not in index_to_data:
                 continue
             name_line, sequence_line = index_to_data[match_idx]
-            name_line = name_line.lstrip('>')
-            out_f.write(f"{query_names[query_idx]}\t{name_line}\t{sequence_line}\t{distance_str}\n")
+            out_f.write(f"{query_names[query_idx]}\t{name_line.lstrip('>')}\t{sequence_line}\t{distance_str}\n")
 
     return output_tsv
 
