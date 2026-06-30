@@ -19,7 +19,7 @@ from sklearn.metrics.pairwise import cosine_distances
 from usearch.index import Index,search, MetricKind, BatchMatches
 import datetime
 
-__version__ = "2.10.0"
+__version__ = "2.10.1"
 
 WORKER_QUERY_EMBEDDINGS = None
 
@@ -144,7 +144,7 @@ def query_bin(bin_file, original_fasta, database_folder, subdatabase_size, cutof
     print(f"Time taken for querying bin {bin_file}: {elapsed_time:.2f} seconds")
     return hits_file.name
 
-def search_faiss_database(original_fasta, database_folder, query_embeddings, query_names, cutoff=0.2, subdatabase_size=10000000, max_workers=4):
+def search_faiss_database(original_fasta, database_folder, query_embeddings, query_names, tmp_folder, cutoff=0.2, subdatabase_size=10000000, max_workers=4):
     """
     Searches a FAISS database with pre-computed embeddings and retrieves the nearest neighbors in parallel.
 
@@ -165,7 +165,7 @@ def search_faiss_database(original_fasta, database_folder, query_embeddings, que
     faiss_database_folder = database_folder+"/faiss"
     bin_files = [file for file in os.listdir(faiss_database_folder) if file.endswith(".bin")]
 
-    tmp_results_dir = tempfile.mkdtemp(prefix="faiss_hits_", dir=database_folder)
+    tmp_results_dir = tempfile.mkdtemp(prefix="faiss_hits_", dir=tmp_folder)
     bin_result_files = []
     with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_search_worker, initargs=(query_embeddings,)) as executor:
         futures = [
@@ -247,7 +247,7 @@ def query_usearch_bin(bin_file, original_fasta, database_folder, subdatabase_siz
     print(f"Time taken for querying bin {bin_file}: {elapsed_time:.2f} seconds")
     return hits_file.name
 
-def search_usearch_database(original_fasta, database_folder, query_embeddings, query_names, cutoff=0.2, subdatabase_size=10000000, max_workers=4):
+def search_usearch_database(original_fasta, database_folder, query_embeddings, query_names, tmp_folder, cutoff=0.2, subdatabase_size=10000000, max_workers=4):
     """
     Searches a usearch database with pre-computed embeddings and retrieves the nearest neighbors in parallel.
 
@@ -256,6 +256,7 @@ def search_usearch_database(original_fasta, database_folder, query_embeddings, q
         database_folder (str): Path to the folder containing usearch database files (.bin).
         query_embeddings (np.ndarray): Pre-computed embeddings for query sequences.
         query_names (list of str): List of query names.
+        tmp_folder (str): Path to the temporary folder for storing intermediate results.
         cutoff (float): Distance cutoff for results.
         subdatabase_size (int): Number of vectors in each usearch subdatabase.
         max_workers (int): Number of parallel workers.
@@ -273,7 +274,7 @@ def search_usearch_database(original_fasta, database_folder, query_embeddings, q
     # bin_files = bin_files[bin_file_random:bin_file_random+100]
     # print("DEBUUUUUGUGkkk")
 
-    tmp_results_dir = tempfile.mkdtemp(prefix="usearch_hits_", dir=database_folder)
+    tmp_results_dir = tempfile.mkdtemp(prefix="usearch_hits_", dir=tmp_folder)
     bin_result_files = []
     with ProcessPoolExecutor(max_workers=max_workers, initializer=_init_search_worker, initargs=(query_embeddings,)) as executor:
         futures = [
@@ -1006,6 +1007,7 @@ if __name__ == "__main__":
             database_folder=database,
             query_embeddings=query_embeddings,
             query_names=query_names,
+            tmp_folder=intermediate_folder,
             cutoff=cutoff,
             subdatabase_size=subdatabase_size,
             max_workers=args.index_threads
@@ -1023,6 +1025,7 @@ if __name__ == "__main__":
             query_names=query_names,
             cutoff=cutoff,
             subdatabase_size=subdatabase_size,
+            tmp_folder=intermediate_folder,
             max_workers=args.index_threads
         )
         db_name = "FAISS"

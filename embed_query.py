@@ -36,12 +36,12 @@ def embed_query_sequences(query_file, gpus_available=True, batch_size=20, reduce
 
         print("Clustering similar proteins with MMseqs2...")
 
-        # Run MMseqs2 easy-linclust in intermediate folder
+        # Run MMseqs2 -cluster in intermediate folder
         cluster_prefix = os.path.join(intermediate_folder, "tmp_query_cluster")
         
         try:
             subprocess.run([
-                "mmseqs", "easy-linclust",
+                "mmseqs", "easy-cluster",
                 query_file,
                 cluster_prefix,
                 intermediate_folder,
