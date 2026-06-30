@@ -19,7 +19,7 @@ from sklearn.metrics.pairwise import cosine_distances
 from usearch.index import Index,search, MetricKind, BatchMatches
 import datetime
 
-__version__ = "2.10.1"
+__version__ = "2.11.0"
 
 WORKER_QUERY_EMBEDDINGS = None
 
@@ -521,6 +521,7 @@ def load_names_from_hits_file(hits_file, query_names, original_fasta, database_f
             if match_idx not in index_to_data:
                 continue
             name_line, sequence_line = index_to_data[match_idx]
+            name_line = name_line.lstrip('>')
             out_f.write(f"{query_names[query_idx]}\t{name_line}\t{sequence_line}\t{distance_str}\n")
 
     return output_tsv
@@ -854,6 +855,29 @@ def calculate_index_threads(database_folder, db_type, max_threads, max_memory_gb
     
     return index_threads
 
+def check_input_fasta(input_fasta):
+    """
+    Check if the input FASTA file exists, is readable, and is proteins (not nucleotides). Raises an error if any check fails.
+    
+    Args:
+        input_fasta (str): Path to the input FASTA file.
+    """
+
+    with open(input_fasta, "r") as f:
+        first_line = f.readline().strip()
+        if not first_line.startswith(">"):
+            raise ValueError(f"Input FASTA file {input_fasta} does not appear to be a valid FASTA file (missing header line).")
+        
+        # Read the first sequence line
+        second_line = f.readline().strip()
+        if not second_line:
+            raise ValueError(f"Input FASTA file {input_fasta} does not contain any sequences.")
+        
+        # Check for nucleotide characters (A, C, G, T, N)
+        nucleotide_chars = set("ACGTNacgtn")
+        sequence_chars = set(second_line)
+        if sequence_chars.issubset(nucleotide_chars):
+            raise ValueError(f"Input FASTA file {input_fasta} appears to contain nucleotide sequences. Please provide protein sequences.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Search a database (FAISS or Usearch) using pre-computed embeddings. Can optionally embed query sequences on-the-fly.")
@@ -877,6 +901,8 @@ if __name__ == "__main__":
     print(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     print("search_database.py version ", __version__)
     print("command line used:\n", " ".join(sys.argv))
+
+    check_input_fasta(args.query_sequences)
     
     # Set up folder structure
     output_folder = args.output.rstrip("/")
@@ -1105,11 +1131,11 @@ if __name__ == "__main__":
             shutil.copyfileobj(in_f, out_f)
     print(f"Diversified hits TSV file written: {diversified_hits_file}")
 
-    for temp_path in [raw_hits_file, sorted_hits_file, named_results_tsv, sorted_named_results_tsv, unique_sorted_tsv]:
-        try:
-            os.remove(temp_path)
-        except FileNotFoundError:
-            pass
+    # for temp_path in [raw_hits_file, sorted_hits_file, named_results_tsv, sorted_named_results_tsv, unique_sorted_tsv]:
+    #     try:
+    #         os.remove(temp_path)
+    #     except FileNotFoundError:
+    #         pass
 
     t3 = time.time()
 
