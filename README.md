@@ -2,6 +2,8 @@
 
 A fast protein sequence search tool using embedding-based similarity search. The tool searches for homologs of a query protein through an embedding-based search engine, and as a last steps aligns the results to the query using Mmseqs2 to provide the user sequence alignments. 
 
+---
+
 ## Installation
 
 ### Requirements
@@ -17,11 +19,12 @@ A fast protein sequence search tool using embedding-based similarity search. The
 
 ### Setup
 
+#### A) Conda 
 Create a conda environment with all dependencies:
 
 ```bash
 # Create and activate environment
-conda create -n search_fasta create  -c pytorch -c nvidia -c conda-forge -c bioconda   python=3.10 mmseqs2 "pytorch>=2.5" pytorch-cuda=12.1   "faiss-cpu>=1.8" numpy scikit-learn transformers einops
+conda create -n search_fasta -c pytorch -c nvidia -c conda-forge -c bioconda python=3.10 mmseqs2 "pytorch>=2.5" pytorch-cuda=12.1   "faiss-cpu>=1.8" numpy scikit-learn transformers einops
 conda activate search_fasta
 pip install usearch
 ```
@@ -36,6 +39,14 @@ And compile the C++ scripts
 cd search_protein
 make
 ```
+
+#### B) Docker 
+
+```bash
+docker pull quay.io/bgruening/logan-protein
+```
+
+---
 
 ## Quick Start
 
