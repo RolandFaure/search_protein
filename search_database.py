@@ -63,7 +63,7 @@ def _write_results_fasta_from_tsv(tsv_file, fasta_file):
             if not line or line.startswith("#"):
                 continue
             query_name, centroid_name, sequence, _distance = line.rstrip("\n").split("\t", 3)
-            out_f.write(f"{centroid_name}#{query_name}\n{sequence}\n")
+            out_f.write(f">{centroid_name}#{query_name}\n{sequence}\n")
 
 
 def _write_unique_centroids_from_tsv(tsv_file, fasta_file):
@@ -78,10 +78,11 @@ def _write_unique_centroids_from_tsv(tsv_file, fasta_file):
             if pair == last_pair:
                 continue
             last_pair = pair
-            out_f.write(f"{centroid_name}\n{sequence}\n")
+            out_f.write(f">{centroid_name}\n{sequence}\n")
 
 
 def _load_filtered_results_from_tsv(tsv_file, matched_centroid_ids):
+    print("DEBUG: matched_centroid_ids:", matched_centroid_ids)
     """Load only rows whose centroid is in matched_centroid_ids."""
     filtered_query_results = []
     with open(tsv_file, "r") as in_f:
@@ -89,7 +90,8 @@ def _load_filtered_results_from_tsv(tsv_file, matched_centroid_ids):
             if not line or line.startswith("#"):
                 continue
             query_name, centroid_name, sequence, distance_str = line.rstrip("\n").split("\t", 3)
-            centroid_id = centroid_name.strip()[1:].split()[0]
+            centroid_id = centroid_name.strip().split()[0]
+            print(f"DEBUG: centroid_id: {centroid_id}, centroid_name: {centroid_name}")
             if centroid_id in matched_centroid_ids:
                 filtered_query_results.append((query_name, centroid_name, sequence, float(distance_str)))
     return filtered_query_results
@@ -794,7 +796,7 @@ def align_centroids_with_mmseqs2(unique_fasta, query_fasta, num_threads, interme
                 fields = line.strip().split("\t")
                 if len(fields) > 0:
                     centroid_id = fields[0]  # First column is the centroid ID
-                    matched_centroids.add(centroid_id)
+                    matched_centroids.add(centroid_id.lstrip(">").split()[0])  # Store only the first part of the header
 
         print(f"Found {len(matched_centroids)} centroids with at least one alignment to query")
         return matched_centroids
@@ -1103,14 +1105,6 @@ if __name__ == "__main__":
     t_align_start = time.time()
     matched_centroids = align_centroids_with_mmseqs2(unique_fasta, args.query_sequences, args.align_threads, intermediate_folder)
     t_align_end = time.time()
-
-    # Filter query_results to keep only centroids that aligned with the query
-    # Extract centroid IDs from the matched set (handling '>' prefix and header parsing)
-    matched_centroid_ids = set()
-    for centroid_id in matched_centroids:
-        # Remove '>' if present and get the first word
-        clean_id = centroid_id.lstrip(">").split()[0]
-        matched_centroid_ids.add(clean_id)
     
     if args.deep_search:
         # Deep search: use all query results without alignment filtering
@@ -1118,9 +1112,10 @@ if __name__ == "__main__":
         filtered_query_results = _load_all_results_from_tsv(sorted_named_results_tsv)
     else:
         # Normal mode: filter to only aligned centroids
-        filtered_query_results = _load_filtered_results_from_tsv(sorted_named_results_tsv, matched_centroid_ids)
+        filtered_query_results = _load_filtered_results_from_tsv(sorted_named_results_tsv, matched_centroids)
 
-    print(f"Filtered results: {len(filtered_query_results)} results from {total_named_results} (kept centroids alignable with query)" if not args.deep_search else f"Deep-search mode: processing all {len(filtered_query_results)} search results")
+    print(f"Filtered results: {len(filtered_query_results)} results from {total_named_results} (kept centroids alignable with query)" if not args.deep_search \
+        else f"Deep-search mode: processing all {len(filtered_query_results)} search results")
 
     # Output all query results as diversified_hits.tsv (main output file) - includes all centroids for user research
     diversified_hits_file = os.path.join(output_folder, "diversified_hits.tsv")
