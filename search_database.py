@@ -83,7 +83,6 @@ def _write_unique_centroids_from_tsv(tsv_file, fasta_file):
 
 def _load_filtered_results_from_tsv(tsv_file, matched_centroid_ids):
     """Load only rows whose centroid is in matched_centroid_ids."""
-    print(f"matched centroids: {matched_centroid_ids}")
     filtered_query_results = []
     with open(tsv_file, "r") as in_f:
         for line in in_f:
@@ -91,7 +90,6 @@ def _load_filtered_results_from_tsv(tsv_file, matched_centroid_ids):
                 continue
             query_name, centroid_name, sequence, distance_str = line.rstrip("\n").split("\t", 3)
             centroid_id = centroid_name.strip().split()[0]
-            print(f"centroid id is {centroid_id}")
             if centroid_id in matched_centroid_ids:
                 filtered_query_results.append((query_name, centroid_name, sequence, float(distance_str)))
     return filtered_query_results
