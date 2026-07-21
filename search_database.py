@@ -711,9 +711,9 @@ def mmseqs2_results(results, query_fasta, output_format, output_file, num_thread
         if output_file:
             # Extract the output folder from the output_file path
             output_folder = os.path.dirname(output_file)
-            matched_fasta = os.path.join(output_folder, "matches.fasta")
+            matched_fasta = os.path.join(output_folder, "aligned_proteins.fasta")
         else:
-            matched_fasta = os.path.join(tmpdir, "matched_proteins.fasta")
+            matched_fasta = os.path.join(tmpdir, "aligned_proteins.fasta")
 
         with open(matched_fasta, "w") as mf:
             for header, seq in matched_records:
@@ -1115,8 +1115,8 @@ if __name__ == "__main__":
     print(f"Filtered results: {len(filtered_query_results)} results from {total_named_results} (kept centroids alignable with query)" if not args.deep_search \
         else f"Deep-search mode: processing all {len(filtered_query_results)} search results")
 
-    # Output all query results as diversified_hits.tsv (main output file) - includes all centroids for user research
-    diversified_hits_file = os.path.join(output_folder, "diversified_hits.tsv")
+    # Output all query results as PLM_aligned_proteins.tsv (main output file) - includes all centroids for user research
+    diversified_hits_file = os.path.join(output_folder, "PLM_aligned_proteins.tsv")
     with open(diversified_hits_file, "w") as out_f:
         out_f.write("#query_name\tresult_name\tresult_sequences\tcosine_distance\n")
         with open(sorted_named_results_tsv, "r") as in_f:
@@ -1138,7 +1138,7 @@ if __name__ == "__main__":
         t4_start = time.time()
 
         # Write all results to intermediate_files
-        fasta_output = os.path.join(intermediate_folder, "all_results.fasta")
+        fasta_output = os.path.join(output_folder, "all_proteins.fasta")
         with open(fasta_output, "w") as fasta_file:
             for name, seq in all_results:
                 if '>' in seq:
@@ -1155,14 +1155,10 @@ if __name__ == "__main__":
                     fasta_file.write(f">{header_clean}#{accession}\n{seq}\n")
 
         # Run MMseqs2 and write main output files to output folder root
-        mmseqs2_output = os.path.join(output_folder, "matches.mmseqs2")
+        mmseqs2_output = os.path.join(output_folder, "aligned_proteins.mmseqs2")
         mmseqs2_results(all_results, args.query_sequences, args.outfmt, mmseqs2_output, args.align_threads, intermediate_folder)
         t4 = time.time()
 
-        # Create top hit file in intermediate_files
-        top_hit_file = os.path.join(intermediate_folder, "matches.top_hit")
-        command = f"awk '!seen[$1]++' {mmseqs2_output} > {top_hit_file}"  # to keep only the first hit
-        subprocess.run(command, shell=True, check=True)
     else:
         t4 = t3
         print("No filtered results, skipping protein extraction and MMseqs2 alignment")
