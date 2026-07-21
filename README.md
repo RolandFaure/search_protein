@@ -68,16 +68,16 @@ python search_database.py --help
 **Output files:**
 ```
 results_folder/
-├── diversified_hits.tsv   # Set of proteins related to you queries according to the gLM2 protein language model
-├── matches.fasta          # Set of proteins aligning on your queries according to mmseqs2
-├── matches.mmseqs2        # Detail of the mmseqs2 alignments
+├── PLM_aligned_proteins.tsv    # Set of proteins related to you queries according to the gLM2 protein language model (Logan50 proteins)
+├── aligned_proteins.fasta  # Set of proteins aligning on your queries according to mmseqs2
+├── aligned_proteins.mmseqs2  # Detail of the mmseqs2 alignments
+├── all_proteins.fasta  # *Only with deep_search* All the proteins in Logan corresponding to the PLM aligned proteins in Logan50
 └── intermediate_files/
     ├── query_embeddings.npy
     ├── query_embeddings.names.txt
     ├── query_results_intermediate.fasta
     ├── query_results.tsv
     ├── unique_centroids.fasta
-    ├── all_results.fasta # All proteins bearing some similarities to query
     └── matches.top_hit
 ```
 
