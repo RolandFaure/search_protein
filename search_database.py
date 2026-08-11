@@ -18,8 +18,9 @@ import shutil
 from sklearn.metrics.pairwise import cosine_distances
 from usearch.index import Index,search, MetricKind, BatchMatches
 import datetime
+import gzip
 
-__version__ = "2.11.2"
+__version__ = "3.0.0"
 
 WORKER_QUERY_EMBEDDINGS = None
 
@@ -571,155 +572,111 @@ def _process_centroid_result(args_tuple):
             os.remove(tmp_filename)
 
 
-def obtain_all_proteins(centroids, database_all_proteins, path_to_centroid_to_prots, num_threads):
+def _format_protein_fasta_header(name):
+    if '>' in name:
+        name = name.lstrip('>')
+    if len(name.split()[0].split("_")) < 4:  # that's because the human and nonhuman db are not exactly formatted the same way
+        header_parts = ''.join(name.split()[1:])
+        accession = name.split()[0][1:]
+        return f">{header_parts}#{accession}"
+
+    header_parts = "_".join(name.split("_")[3:])
+    header_clean = "".join(header_parts.split())
+    accession = "_".join(name.split("_")[:3])
+    return f">{header_clean}#{accession}"
+
+
+def obtain_all_proteins(centroids, database_all_proteins, path_to_centroid_to_prots, num_threads, output_file):
     """
-    For each result, runs an external command to extract proteins and parses the output.
+    For each result, runs an external command to extract proteins and writes them directly to a FASTA file.
     """
-    all_results = []
+    unique_results = set()
     # Use ProcessPoolExecutor instead of ThreadPoolExecutor to avoid GIL contention
-    with ProcessPoolExecutor(max_workers=num_threads) as executor:
-        # Pass all arguments as a tuple since process_result needs to be at module level
-        futures = [executor.submit(_process_centroid_result, (centroid, database_all_proteins, path_to_centroid_to_prots)) for centroid in centroids]
-        for i, future in enumerate(as_completed(futures), 1):
-            proteins = future.result()
-            all_results.extend(proteins)
-        all_results = list(set(all_results))
-        print("At the end, keeping ", len(all_results), " unique hits")
-    
-    return all_results
+    with open(output_file, "w") as out_f:
+        with ProcessPoolExecutor(max_workers=num_threads) as executor:
+            # Pass all arguments as a tuple since process_result needs to be at module level
+            futures = [executor.submit(_process_centroid_result, (centroid, database_all_proteins, path_to_centroid_to_prots)) for centroid in centroids]
+            for i, future in enumerate(as_completed(futures), 1):
+                proteins = future.result()
+                for name, seq in proteins:
+                    fasta_header = _format_protein_fasta_header(name)
+                    fasta_entry = (fasta_header, seq)
+                    if fasta_entry in unique_results:
+                        continue
+                    unique_results.add(fasta_entry)
+                    out_f.write(f"{fasta_header}\n{seq}\n")
 
 
-def mmseqs2_results(results, query_fasta, output_format, output_file, num_threads, intermediate_folder=None):
+def mmseqs2_results(original_query_fasta, returned_sequences_fasta, output_format, output_file, output_fasta_file, num_threads, intermediate_folder):
     """
-    Run MMseqs2 search instead of BLAST for the given results.
+    Run MMseqs2 search between two existing FASTA files.
     """
 
     print("Running MMseqs2 now...")
-    sequences = {}
-    with open(query_fasta, "r") as f:
+
+    original_query_mmseqs = os.path.join(intermediate_folder, "original_query_mmseqs")
+    returned_sequences_mmseqs = os.path.join(intermediate_folder, "returned_sequences_mmseqs")
+    result_mmseqs = os.path.join(intermediate_folder, "result_mmseqs")
+    tmp_mmseqs = os.path.join(intermediate_folder, "tmp_mmseqs")
+
+    # Set up log files for mmseqs2 output
+    log_file_1 = os.path.join(intermediate_folder, "mmseqs_createdb_1.log") if intermediate_folder else os.devnull
+    log_file_2 = os.path.join(intermediate_folder, "mmseqs_createdb_2.log") if intermediate_folder else os.devnull
+    log_file_search = os.path.join(intermediate_folder, "mmseqs_search.log") if intermediate_folder else os.devnull
+    log_file_convertalis = os.path.join(intermediate_folder, "mmseqs_convertalis.log") if intermediate_folder else os.devnull
+
+    with open(log_file_1, "w") as lf1, open(log_file_2, "w") as lf2, open(log_file_search, "w") as lfs, open(log_file_convertalis, "w") as lfc:
+        subprocess.run(["mmseqs", "createdb", original_query_fasta, original_query_mmseqs], check=True, stdout=lf1, stderr=subprocess.STDOUT)
+        subprocess.run(["mmseqs", "createdb", returned_sequences_fasta, returned_sequences_mmseqs], check=True, stdout=lf2, stderr=subprocess.STDOUT)
+
+    with open(log_file_search, "w") as lfs:
+        # print(f"Running command: mmseqs search {returned_sequences_mmseqs} {original_query_mmseqs} {result_mmseqs} {tmp_mmseqs} --threads {num_threads}")
+        #remove the result database if it already exists to avoid errors
+        os.system(f"rm -rf {result_mmseqs}*")
+        subprocess.run([
+            "mmseqs", "search", returned_sequences_mmseqs, original_query_mmseqs, result_mmseqs, tmp_mmseqs,
+            "--threads", str(num_threads)
+        ], check=True, stdout=lfs, stderr=subprocess.STDOUT)
+
+
+    print(f"Output format for MMseqs2 convertalis: {output_format}")
+    if output_format == "0":
+        with open(output_file, "w") as out_f:
+            out_f.write("#target\tquery\tidentity\talignment_length\tnb_mismatches\tnb_gap_openings\ttarget_start\ttarget_end\tquery_start\tquery_end\tevalue\tbitscore\n")
+
+    with open(log_file_convertalis, "w") as lfc:
+        # print(f"Running command: mmseqs convertalis {original_query_mmseqs} {returned_sequences_mmseqs} {result_mmseqs} {output_file} --format-mode {output_format}")
+        subprocess.run([
+            "mmseqs", "convertalis", returned_sequences_mmseqs, original_query_mmseqs, result_mmseqs, output_file,
+            "--format-mode", output_format
+        ], check=True, stdout=lfc, stderr=subprocess.STDOUT)
+
+    #now create a FASTA file with the aligned sequences: load the name of all aligned sequences in the mmseqs2 output and extract them from the target FASTA file
+    aligned_ids = set()
+    with open(output_file, "r") as resf:
+        for line in resf:
+            if line.startswith("#"):
+                continue
+            fields = line.strip().split("\t")
+            if len(fields) > 0:
+                aligned_ids.add(fields[0])  # First column is the target ID
+
+    print(f"Found {len(aligned_ids)} aligned sequences in MMseqs2 results: {list(aligned_ids)[0:5]}... Now looking for them in {returned_sequences_fasta} to create {output_fasta_file}")
+
+    with open(returned_sequences_fasta, "r") as target_f, open(output_fasta_file, "w") as out_f:
         name = None
         seq = []
-        for line in f:
+        for line in target_f:
             line = line.strip()
             if line.startswith(">"):
-                if name is not None:
-                    sequences[name] = "".join(seq)
-                name = line
+                if name is not None and name in aligned_ids:
+                    out_f.write(f"{name}\n{''.join(seq)}\n")
+                name = line.lstrip('>')
                 seq = []
             else:
                 seq.append(line)
-        if name is not None:
-            sequences[name] = "".join(seq)
-
-    # Create a temporary directory to store files
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Write all query sequences to a FASTA file (database)
-        db_fasta = os.path.join(tmpdir, "db.fasta")
-        with open(db_fasta, "w") as dbf:
-            for name, seq in sequences.items():
-                dbf.write(f"{name}\n{seq}\n")
-
-        # Write all results sequences to a FASTA file
-        query_fasta = os.path.join(tmpdir, "target.fasta")
-        with open(query_fasta, "w") as qf:
-            for name, seq in results:
-                #there are two different formats
-                if len("".join("_".join(name.split("_")[:3]).split())) < len(name.split(" ")[0]) :
-                    processed_name = "".join("_".join(name.split("_")[3:]).split())
-                else :
-                    processed_name = "".join(name.split(" ")[1:])
-                qf.write(f">{processed_name}\n{seq}\n")
-
-        # Create MMseqs2 database
-        db_mmseqs = os.path.join(tmpdir, "db_mmseqs")
-        query_mmseqs = os.path.join(tmpdir, "query_mmseqs")
-        result_mmseqs = os.path.join(tmpdir, "result_mmseqs")
-        tmp_mmseqs = os.path.join(tmpdir, "tmp_mmseqs")
-
-        # Set up log files for mmseqs2 output
-        log_file_1 = os.path.join(intermediate_folder, "mmseqs_createdb_1.log") if intermediate_folder else os.devnull
-        log_file_2 = os.path.join(intermediate_folder, "mmseqs_createdb_2.log") if intermediate_folder else os.devnull
-        log_file_search = os.path.join(intermediate_folder, "mmseqs_search.log") if intermediate_folder else os.devnull
-        log_file_convertalis = os.path.join(intermediate_folder, "mmseqs_convertalis.log") if intermediate_folder else os.devnull
-        
-        with open(log_file_1, "w") as lf1, open(log_file_2, "w") as lf2, open(log_file_search, "w") as lfs, open(log_file_convertalis, "w") as lfc:
-            subprocess.run(["mmseqs", "createdb", db_fasta, db_mmseqs], check=True, stdout=lf1, stderr=subprocess.STDOUT)
-            subprocess.run(["mmseqs", "createdb", query_fasta, query_mmseqs], check=True, stdout=lf2, stderr=subprocess.STDOUT)
-
-        print("mmseq created databases ")
-
-        # Run MMseqs2 search
-        with open(log_file_search, "w") as lfs:
-            subprocess.run([
-                "mmseqs", "search", query_mmseqs, db_mmseqs, result_mmseqs, tmp_mmseqs,
-                "--threads", str(num_threads)
-            ], check=True, stdout=lfs, stderr=subprocess.STDOUT)
-
-        # Convert results to tabular format
-        result_tsv = os.path.join(tmpdir, "result.tsv")
-        with open(log_file_convertalis, "w") as lfc:
-            subprocess.run([
-                "mmseqs", "convertalis", query_mmseqs, db_mmseqs, result_mmseqs, result_tsv,
-                "--format-mode", output_format
-            ], check=True, stdout=lfc, stderr=subprocess.STDOUT)
-
-        # Output results
-        with open(result_tsv, "r") as resf:
-            if output_file:
-                with open(output_file, "w") as out_f:
-                    if output_format == '0':  # this is the default, output the header
-                        out_f.write("#target\tquery\tidentity\talignment_length\tnb_mismatches\tnb_gap_openings\ttarget_start\ttarget_end\tquery_start\tquery_end\tevalue\tbitscore\n")
-                    out_f.write(resf.read())
-            else:
-                print(resf.read())
-
-        # Parse MMseqs2 tabular results to collect matched query IDs and write a FASTA
-        matched_queries = set()
-        with open(result_tsv, "r") as resf:
-            for line in resf:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                cols = line.split("\t")
-                if len(cols) >= 1:
-                    matched_queries.add(cols[0].lstrip(">"))
-
-        # Read the query (target) FASTA we created and keep only matched entries
-        matched_records = []
-        with open(query_fasta, "r") as qf:
-            header = None
-            seq_lines = []
-            for line in qf:
-                line = line.rstrip("\n")
-                if line.startswith(">"):
-                    if header is not None:
-                        h_full = header.lstrip(">")
-                        h_first = h_full.split()[0]
-                        if h_full in matched_queries or h_first in matched_queries:
-                            matched_records.append((header, "".join(seq_lines)))
-                    header = line
-                    seq_lines = []
-                else:
-                    seq_lines.append(line.strip())
-            if header is not None:
-                h_full = header.lstrip(">")
-                h_first = h_full.split()[0]
-                if h_full in matched_queries or h_first in matched_queries:
-                    matched_records.append((header, "".join(seq_lines)))
-
-        # Write matched proteins to a FASTA file in the output folder root
-        if output_file:
-            # Extract the output folder from the output_file path
-            output_folder = os.path.dirname(output_file)
-            matched_fasta = os.path.join(output_folder, "aligned_proteins.fasta")
-        else:
-            matched_fasta = os.path.join(tmpdir, "aligned_proteins.fasta")
-
-        with open(matched_fasta, "w") as mf:
-            for header, seq in matched_records:
-                mf.write(f"{header}\n{seq}\n")
-
-        print(f"Wrote {len(matched_records)} matched proteins to {matched_fasta}")
+        if name is not None and name in aligned_ids:
+            out_f.write(f"{name}\n{''.join(seq)}\n")
 
 
 def align_centroids_with_mmseqs2(unique_fasta, query_fasta, num_threads, intermediate_folder=None):
@@ -882,19 +839,24 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Search a database (FAISS or Usearch) using pre-computed embeddings. Can optionally embed query sequences on-the-fly.")
     parser.add_argument("--query_sequences", required=True, help="Fasta file of queries")
     parser.add_argument("--database", required=True, help="Path to the folder containing database files.")
-    parser.add_argument("--output", "-o", required=True, help="Path to the output folder (created by embed_query.py if embedding step was run separately).")
-    parser.add_argument("--db-type", type=str, choices=['faiss', 'usearch'], default='faiss', help="Database type to use: faiss or usearch (default: faiss)")
+    parser.add_argument("--output", "-o", required=True, help="Path to the output folder (created by embed_query.py if embedding step was run separately)")
+    parser.add_argument("--db-type", type=str, choices=['faiss', 'usearch'], default='usearch', help="Database type to use: faiss or usearch (default: usearch)")
     parser.add_argument("--outfmt", type=str, default='0', help="Format of the mmseqs2 output [0], default is 0 which is a tabular format with header. See mmseqs2 documentation for details.")
     parser.add_argument("-m", "--memory", type=float, required=True, help="Maximum memory available in GB (mandatory)")
     parser.add_argument("-t", "--num_threads", type=int, required=True, help="Maximum number of threads available (mandatory)")
     parser.add_argument("--force_cpu", action="store_true", help="Force the use of CPU even if GPUs are available (for embedding step).")
-    parser.add_argument("--deep-search", action="store_true", help="If enabled, extract proteins from all search results instead of only aligned centroids, then align everything with MMseqs2")
-    parser.add_argument("-r","--do_not_reduce_query", action="store_true", help="Do not cluster similar proteins to reduce time (identity > 0.9)")
+    # parser.add_argument("-r","--do_not_reduce_query", action="store_true", help="Do not cluster similar proteins to reduce time (identity > 0.9)")
     #parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss database")
     #parser.add_argument("--cutoff", type=float, default=0.2, help="Distance cutoff for results")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
+
+    # Validate that query_sequences is provided for MMseqs2 alignment
+    if not args.query_sequences:
+        print("Error: --query_sequences is required for MMseqs2 alignment step.")
+        print("Please provide the path to your query FASTA file.")
+        exit(1)
 
 
     print(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -908,7 +870,8 @@ if __name__ == "__main__":
     intermediate_folder = os.path.join(output_folder, "intermediate_files")
     embeddings_file = os.path.join(intermediate_folder, "query_embeddings.npy")
 
-    reduce_query = not args.do_not_reduce_query
+    # reduce_query = not args.do_not_reduce_query
+    reduce_query = False
     
     # Check if embeddings need to be created
     embeddings_exist = os.path.exists(embeddings_file)
@@ -964,11 +927,6 @@ if __name__ == "__main__":
     else:
         print(f"Found existing embeddings in {output_folder}")
     
-    # Validate that query_sequences is provided for MMseqs2 alignment
-    if not args.query_sequences:
-        print("Error: --query_sequences is required for MMseqs2 alignment step.")
-        print("Please provide the path to your query FASTA file.")
-        exit(1)
     
     # Validate output folder and intermediate files exist
     if not os.path.exists(output_folder):
@@ -986,7 +944,7 @@ if __name__ == "__main__":
     print(f"Configuration: index_threads={args.index_threads}, align_threads={args.align_threads}")
     
     cutoff = 0.2 #cosine distance cutoff
-    subdatabase_size = 100_000
+    subdatabase_size = 100_000 #this is linked to the size of the databases, do not change this unless you know what you are doing
     group_distance = 0 #when using 0.1, the papilloma query hit 10B proteins, which is too much
     path_to_centroid_to_prots = os.path.join(os.path.dirname(__file__), "centroid_to_prots")
 
@@ -1089,8 +1047,6 @@ if __name__ == "__main__":
     intermediate_fasta = os.path.join(intermediate_folder, "query_results_intermediate.fasta")
     _write_results_fasta_from_tsv(sorted_named_results_tsv, intermediate_fasta)
     # print(f"Intermediate FASTA file written: {intermediate_fasta}")
-    # print("EXITITNG NOW TO CHECK INTERMEDIATE FILES, COMMENT THIS EXIT TO RUN THE WHOLE PIPELINE")
-    # sys.exit(0)
 
     # Write a deduplicated intermediate FASTA file in intermediate_files (unique centroid name/seq pairs)
     unique_fasta = os.path.join(intermediate_folder, "unique_centroids.fasta")
@@ -1104,19 +1060,9 @@ if __name__ == "__main__":
     matched_centroids = align_centroids_with_mmseqs2(unique_fasta, args.query_sequences, args.align_threads, intermediate_folder)
     t_align_end = time.time()
     
-    if args.deep_search:
-        # Deep search: use all query results without alignment filtering
-        print("Using deep-search mode: extracting proteins from ALL search results (no alignment filtering)")
-        filtered_query_results = _load_all_results_from_tsv(sorted_named_results_tsv)
-    else:
-        # Normal mode: filter to only aligned centroids
-        filtered_query_results = _load_filtered_results_from_tsv(sorted_named_results_tsv, matched_centroids)
 
-    print(f"Filtered results: {len(filtered_query_results)} results from {total_named_results} (kept centroids alignable with query)" if not args.deep_search \
-        else f"Deep-search mode: processing all {len(filtered_query_results)} search results")
-
-    # Output all query results as PLM_aligned_proteins.tsv (main output file) - includes all centroids for user research
-    diversified_hits_file = os.path.join(output_folder, "PLM_aligned_proteins.tsv")
+    # Output all query results as PLM_similar_proteins.tsv (arguably main output file) - includes all centroids for user research
+    diversified_hits_file = os.path.join(output_folder, "PLM_similar_proteins.tsv")
     with open(diversified_hits_file, "w") as out_f:
         out_f.write("#query_name\tresult_name\tresult_sequences\tcosine_distance\n")
         with open(sorted_named_results_tsv, "r") as in_f:
@@ -1131,37 +1077,35 @@ if __name__ == "__main__":
 
     t3 = time.time()
 
+    plm_query_results = _load_all_results_from_tsv(sorted_named_results_tsv)
+
+    print(f"Total number of centroids hitting the query: {len(plm_query_results)}")
+
     # Optionally continue with protein extraction and full alignment
-    if len(filtered_query_results) > 0:
-        centroid_hits = list(set([x[1] for x in filtered_query_results]))
-        all_results = obtain_all_proteins(centroid_hits, database+"/all_prots", path_to_centroid_to_prots, args.index_threads)
+    if len(plm_query_results) > 0:
+        centroid_hits = list(set([x[1] for x in plm_query_results]))
+        fasta_output = os.path.join(output_folder, "all_proteins.fasta")
+        obtain_all_proteins(centroid_hits, database+"/all_prots", path_to_centroid_to_prots, args.index_threads, fasta_output)
+        #gzip the fasta file to save space
+        time_now = time.time()
+        with open(fasta_output, 'rb') as f_in:
+            with gzip.open(fasta_output + '.gz', 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        os.remove(fasta_output)
+        print(f"All proteins FASTA file written: {fasta_output}.gz, compressed in {time.time() - time_now:.2f} seconds")
         t4_start = time.time()
 
-        # Write all results to intermediate_files
-        fasta_output = os.path.join(output_folder, "all_proteins.fasta")
-        with open(fasta_output, "w") as fasta_file:
-            for name, seq in all_results:
-                if '>' in seq:
-                    print("WARNING{db_name} found in sequence: ", seq)
-                if len(name.split()[0].split("_")) < 4:  # that's because the human and nonhuman db are not exactly formatted the same way
-                    header_parts = ''.join(name.split()[1:])
-                    accession = name.split()[0][1:]
-                    fasta_file.write(f">{header_parts}#{accession}\n{seq}\n")
-                else:
-                    # Extract header and accession from the name
-                    header_parts = "_".join(name.split("_")[3:])
-                    header_clean = "".join(header_parts.split())
-                    accession = "_".join(name.lstrip('>').split("_")[:3])
-                    fasta_file.write(f">{header_clean}#{accession}\n{seq}\n")
+        filtered_fasta_output = os.path.join(intermediate_folder, "all_proteins_filtered.fasta")
+        filtered_query_results = _load_filtered_results_from_tsv(sorted_named_results_tsv, matched_centroids)
+        centroids_fitered = list(set([x[1] for x in filtered_query_results]))
+        obtain_all_proteins(centroids_fitered, database+"/all_prots", path_to_centroid_to_prots, args.index_threads, filtered_fasta_output)
+        fasta_output = filtered_fasta_output
 
         # Run MMseqs2 and write main output files to output folder root
         mmseqs2_output = os.path.join(output_folder, "aligned_proteins.mmseqs2")
-        mmseqs2_results(all_results, args.query_sequences, args.outfmt, mmseqs2_output, args.align_threads, intermediate_folder)
+        fasta_mmseqs_output = os.path.join(output_folder, "aligned_proteins.fasta")
+        mmseqs2_results(args.query_sequences, filtered_fasta_output, args.outfmt, mmseqs2_output, fasta_mmseqs_output, args.align_threads, intermediate_folder)
         t4 = time.time()
-
-    else:
-        t4 = t3
-        print("No filtered results, skipping protein extraction and MMseqs2 alignment")
 
     print(f"Time for querying {db_name} database: {t2 - t1:.2f} seconds")
     print(f"Time for centroid alignment: {t_align_end - t_align_start:.2f} seconds")
