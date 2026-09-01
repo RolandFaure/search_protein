@@ -20,7 +20,7 @@ from usearch.index import Index,search, MetricKind, BatchMatches
 import datetime
 import gzip
 
-__version__ = "3.0.0"
+__version__ = "3.1.1"
 
 WORKER_QUERY_EMBEDDINGS = None
 
@@ -606,6 +606,11 @@ def obtain_all_proteins(centroids, database_all_proteins, path_to_centroid_to_pr
                     unique_results.add(fasta_entry)
                     out_f.write(f"{fasta_header}\n{seq}\n")
 
+    # #Actually, do a different strategy with the single files
+    # protein_file = database_all_proteins + "proteins.fasta.zst"
+    # protein_index_file = database_all_proteins + "proteins.index.tsv"
+    # #index file is a TSV with two columns: protein_id and position in the zst. 
+
 
 def mmseqs2_results(original_query_fasta, returned_sequences_fasta, output_format, output_file, output_fasta_file, num_threads, intermediate_folder):
     """
@@ -671,7 +676,6 @@ def mmseqs2_results(original_query_fasta, returned_sequences_fasta, output_forma
             if line.startswith(">"):
                 if name is not None and name in aligned_ids:
                     out_f.write(f"{name}\n{''.join(seq)}\n")
-                name = line.lstrip('>')
                 seq = []
             else:
                 seq.append(line)
