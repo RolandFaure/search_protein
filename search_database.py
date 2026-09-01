@@ -590,26 +590,55 @@ def obtain_all_proteins(centroids, database_all_proteins, path_to_centroid_to_pr
     """
     For each result, runs an external command to extract proteins and writes them directly to a FASTA file.
     """
-    unique_results = set()
-    # Use ProcessPoolExecutor instead of ThreadPoolExecutor to avoid GIL contention
-    with open(output_file, "w") as out_f:
-        with ProcessPoolExecutor(max_workers=num_threads) as executor:
-            # Pass all arguments as a tuple since process_result needs to be at module level
-            futures = [executor.submit(_process_centroid_result, (centroid, database_all_proteins, path_to_centroid_to_prots)) for centroid in centroids]
-            for i, future in enumerate(as_completed(futures), 1):
-                proteins = future.result()
-                for name, seq in proteins:
-                    fasta_header = _format_protein_fasta_header(name)
-                    fasta_entry = (fasta_header, seq)
-                    if fasta_entry in unique_results:
-                        continue
-                    unique_results.add(fasta_entry)
-                    out_f.write(f"{fasta_header}\n{seq}\n")
+    # unique_results = set()
+    # # Use ProcessPoolExecutor instead of ThreadPoolExecutor to avoid GIL contention
+    # with open(output_file, "w") as out_f:
+    #     with ProcessPoolExecutor(max_workers=num_threads) as executor:
+    #         # Pass all arguments as a tuple since process_result needs to be at module level
+    #         futures = [executor.submit(_process_centroid_result, (centroid, database_all_proteins, path_to_centroid_to_prots)) for centroid in centroids]
+    #         for i, future in enumerate(as_completed(futures), 1):
+    #             proteins = future.result()
+    #             for name, seq in proteins:
+    #                 fasta_header = _format_protein_fasta_header(name)
+    #                 fasta_entry = (fasta_header, seq)
+    #                 if fasta_entry in unique_results:
+    #                     continue
+    #                 unique_results.add(fasta_entry)
+    #                 out_f.write(f"{fasta_header}\n{seq}\n")
 
-    # #Actually, do a different strategy with the single files
-    # protein_file = database_all_proteins + "proteins.fasta.zst"
-    # protein_index_file = database_all_proteins + "proteins.index.tsv"
-    # #index file is a TSV with two columns: protein_id and position in the zst. 
+    #Actually, do a different strategy with the single files
+    protein_file = database_all_proteins + "proteins.fasta.zst"
+    protein_index_file = database_all_proteins + "proteins.fasta.zst.index"
+    #index file is a TSV with three columns: protein_id (sorted), frame position in the zst file and length of frame in bytes. We can use this index to extract the proteins we want without decompressing the whole file
+
+    #start by sorting the centroids
+    sorted_centroids = sorted(centroids)
+
+    #now go through the index file and extract the proteins we want
+    with open(protein_index_file, "r") as index_f, open(protein_file, "r") as protein_f, open(output_file, "w") as out_f:
+        next_protein_id_to_look_at = 0
+        next_protein_name = sorted_centroids[next_protein_id_to_look_at]
+        for enumerate(l,line) in index_f:
+            protein_id, frame_position, frame_length = line.strip().split("\t")
+            if protein_id == next_protein_name:
+                # Extract the protein from the zst file
+                protein_f.seek(int(frame_position))
+                protein_data = protein_f.read(int(frame_length))
+                out_f.write(protein_data)
+            
+                next_protein_id_to_look_at += 1
+                next_protein_name = sorted_centroids[next_protein_id_to_look_at]
+                if next_protein_id_to_look_at >= len(sorted_centroids):
+                    break
+            
+            if l % 10000 == 0:
+                print(f"Processed {l} lines in the index file. Found {next_protein_id_to_look_at} proteins so far.")
+
+    print("Finished fishing out the proteins from the zst file. Now decompressing the output to a fasta file...")
+    sys.exit(0)
+
+    #the output is a zst file, so we need to decompress it to a fasta file
+    os.system(f"zstd -d {output_file} -o {output_file.tmp} && mv {output_file.tmp} {output_file}")
 
 
 def mmseqs2_results(original_query_fasta, returned_sequences_fasta, output_format, output_file, output_fasta_file, num_threads, intermediate_folder):
