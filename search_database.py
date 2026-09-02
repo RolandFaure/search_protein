@@ -19,6 +19,11 @@ from sklearn.metrics.pairwise import cosine_distances
 from usearch.index import Index,search, MetricKind, BatchMatches
 import datetime
 import gzip
+import os
+import time
+import bisect
+import multiprocessing
+from multiprocessing import Process
 
 __version__ = "3.1.1"
 
@@ -526,52 +531,6 @@ def load_names_from_hits_file(hits_file, query_names, original_fasta, database_f
 
     return output_tsv
 
-
-def _process_centroid_result(args_tuple):
-    """
-    Helper function for obtain_all_proteins. Must be at module level for ProcessPoolExecutor.
-    Extracts proteins for a single centroid.
-    """
-    centroid_name, database_all_proteins, path_to_centroid_to_prots = args_tuple
-    centroid_id = centroid_name.strip().lstrip('>').split(' ')[0]
-    proteins = []
-    tmp_filename = None
-    try:
-        fd, tmp_filename = tempfile.mkstemp(prefix=f"tmp_{os.getpid()}_", suffix=".fa")
-        os.close(fd)
-
-        try:
-            with open(tmp_filename, "w") as tmp_out:
-                subprocess.run(
-                    [path_to_centroid_to_prots, database_all_proteins, centroid_id],
-                    stdout=tmp_out,
-                    check=True,
-                )
-        except subprocess.CalledProcessError:
-            # Silently fail - return empty proteins list
-            return proteins
-
-        with open(tmp_filename, "r") as tmp_file:
-            name = None
-            seq = ""
-            for line in tmp_file:
-                line = line.strip()
-                if line.startswith(">"):
-                    if name is not None and seq:
-                        proteins.append((name, seq))
-                    name = line
-                    seq = ""
-                else:
-                    seq = line
-            if name is not None and seq:
-                proteins.append((name, seq))
-
-        return proteins
-    finally:
-        if tmp_filename and os.path.exists(tmp_filename):
-            os.remove(tmp_filename)
-
-
 def _format_protein_fasta_header(name):
     if '>' in name:
         name = name.lstrip('>')
@@ -586,60 +545,187 @@ def _format_protein_fasta_header(name):
     return f">{header_clean}#{accession}"
 
 
-def obtain_all_proteins(centroids, database_all_proteins, path_to_centroid_to_prots, num_threads, output_file):
+
+def _worker_process_obtain_all_proteins(worker_id, index_path, protein_path, output_path, 
+                    start_byte, end_byte, file_size, 
+                    sorted_centroids_bytes, protein_file_handle_shared):
     """
-    For each result, runs an external command to extract proteins and writes them directly to a FASTA file.
+    Worker process to handle a specific byte range of the index file.
     """
-    # unique_results = set()
-    # # Use ProcessPoolExecutor instead of ThreadPoolExecutor to avoid GIL contention
-    # with open(output_file, "w") as out_f:
-    #     with ProcessPoolExecutor(max_workers=num_threads) as executor:
-    #         # Pass all arguments as a tuple since process_result needs to be at module level
-    #         futures = [executor.submit(_process_centroid_result, (centroid, database_all_proteins, path_to_centroid_to_prots)) for centroid in centroids]
-    #         for i, future in enumerate(as_completed(futures), 1):
-    #             proteins = future.result()
-    #             for name, seq in proteins:
-    #                 fasta_header = _format_protein_fasta_header(name)
-    #                 fasta_entry = (fasta_header, seq)
-    #                 if fasta_entry in unique_results:
-    #                     continue
-    #                 unique_results.add(fasta_entry)
-    #                 out_f.write(f"{fasta_header}\n{seq}\n")
-
-    #Actually, do a different strategy with the single files
-    protein_file = database_all_proteins + "proteins.fasta.zst"
-    protein_index_file = database_all_proteins + "proteins.fasta.zst.index"
-    #index file is a TSV with three columns: protein_id (sorted), frame position in the zst file and length of frame in bytes. We can use this index to extract the proteins we want without decompressing the whole file
-
-    #start by sorting the centroids
-    sorted_centroids = sorted(centroids)
-
-    #now go through the index file and extract the proteins we want
-    with open(protein_index_file, "r") as index_f, open(protein_file, "r") as protein_f, open(output_file, "w") as out_f:
-        next_protein_id_to_look_at = 0
-        next_protein_name = sorted_centroids[next_protein_id_to_look_at]
-        for enumerate(l,line) in index_f:
-            protein_id, frame_position, frame_length = line.strip().split("\t")
-            if protein_id == next_protein_name:
-                # Extract the protein from the zst file
-                protein_f.seek(int(frame_position))
-                protein_data = protein_f.read(int(frame_length))
-                out_f.write(protein_data)
+    # Open files locally within the process
+    with open(index_path, "rb") as index_f, \
+         open(protein_path, "rb") as protein_f:
+        
+        # --- 1. BOUNDARY ALIGNMENT ---
+        index_f.seek(start_byte)
+        if start_byte > 0:
+            # Discard the partial line we landed in the middle of
+            index_f.readline()
+        
+        # Read first valid line to determine start ID
+        line = index_f.readline()
+        if not line:
+            return # Empty chunk
             
-                next_protein_id_to_look_at += 1
-                next_protein_name = sorted_centroids[next_protein_id_to_look_at]
-                if next_protein_id_to_look_at >= len(sorted_centroids):
+        parts = line.split(b"\t")
+        current_protein_id = parts[0]
+        
+        # --- 2. CENTROID SYNC (Fast Skip) ---
+        # Find the first centroid >= current_protein_id using binary search
+        centroid_idx = bisect.bisect_left(sorted_centroids_bytes, current_protein_id)
+        
+        # If all centroids are smaller than this chunk's start, we are done
+        if centroid_idx >= len(sorted_centroids_bytes):
+            return
+
+        next_protein_name = sorted_centroids_bytes[centroid_idx]
+        
+        # --- 3. PROCESSING LOOP ---
+        with open(output_path, "wb") as out_f:
+            while True:
+                current_pos = index_f.tell()
+                if current_pos >= end_byte:
                     break
-            
-            if l % 10000 == 0:
-                print(f"Processed {l} lines in the index file. Found {next_protein_id_to_look_at} proteins so far.")
+                
+                # Compare IDs
+                while current_protein_id < next_protein_name:
+                    # --- FAST FORWARD INDEX ---
+                    # We are behind the target centroid. Skip forward.
+                    last_safe_position = current_pos
+                    
+                    # Jump 1MB if within bounds
+                    jump_size = 1024 * 1024
+                    if current_pos + jump_size < end_byte:
+                        index_f.seek(jump_size, 1)
+                        # Resync: discard partial line
+                        index_f.readline()
+                    else:
+                        # Near end of chunk, just read next line
+                        pass
+                    
+                    # Read next line
+                    line = index_f.readline()
+                    if not line:
+                        break
+                    current_protein_id = line.split(b"\t")[0]
+                
+                #now go back to last safe position and read line by line
+                index_f.seek(last_safe_position)
+                line = index_f.readline()
+                if not line:
+                    break
+                current_protein_id = line.split(b"\t")[0]
+                while current_protein_id < next_protein_name:
+                    line = index_f.readline()
+                    if not line:
+                        break
+                    current_protein_id = line.split(b"\t")[0]
+                    
+                if current_protein_id == next_protein_name:
+                    # --- MATCH FOUND ---
+                    try:
+                        protein_id, frame_position, frame_length = line.strip().split(b"\t")
+                        frame_position = int(frame_position)
+                        frame_length = int(frame_length)
+                        
+                        # Extract binary data
+                        protein_f.seek(frame_position) 
+                        protein_data = protein_f.read(frame_length)
+                        
+                        if len(protein_data) != frame_length:
+                            raise IOError(f"Failed to read full frame for {protein_id}. Expected {frame_length}, got {len(protein_data)}")
+                            
+                        out_f.write(protein_data)
+                        
+                        # Advance both
+                        centroid_idx += 1
+                        if centroid_idx >= len(sorted_centroids_bytes):
+                            break # All centroids processed
+                        next_protein_name = sorted_centroids_bytes[centroid_idx]
+                        
+                        # Read next index line
+                        line = index_f.readline()
+                        if not line:
+                            break
+                        current_protein_id = line.split(b"\t")[0]
+                        
+                    except Exception as e:
+                        # Raise error as requested (Point 5)
+                        # Note: Printing here because raising in subprocess doesn't always propagate cleanly without Queue
+                        print(f"ERROR in worker {worker_id}: {e}", file=sys.stderr)
+                        raise e
 
-    print("Finished fishing out the proteins from the zst file. Now decompressing the output to a fasta file...")
-    sys.exit(0)
+                else: # current_protein_id > next_protein_name
+                    # --- MISSED CENTROID ---
+                    # The centroid we are looking for is smaller than current index ID.
+                    # It should have been in a previous chunk. Skip this centroid.
+                    # print(f"Worker {worker_id}: Missed centroid {next_protein_name.decode('utf-8')}. Current index ID: {current_protein_id.decode('utf-8')}", file=sys.stderr)
+                    centroid_idx += 1
+                    if centroid_idx >= len(sorted_centroids_bytes):
+                        break
+                    next_protein_name = sorted_centroids_bytes[centroid_idx]
+                    # Do not read next index line, check current line against new centroid
 
-    #the output is a zst file, so we need to decompress it to a fasta file
-    os.system(f"zstd -d {output_file} -o {output_file.tmp} && mv {output_file.tmp} {output_file}")
+def obtain_all_proteins(centroids, database_all_proteins, path_to_centroid_to_prots, num_threads, output_file, tmp_folder):
+    time_start = time.time()
 
+    protein_file = database_all_proteins + "/proteins.fasta.zst"
+    protein_index_file = database_all_proteins + "/proteins.fasta.zst.index"
+    
+    # 1. Prepare centroids
+    sorted_centroids = sorted([i.split()[0] for i in centroids])
+    sorted_centroids_bytes = [name.encode('utf-8') for name in sorted_centroids]
+    print(f"Sorted {len(sorted_centroids)} centroids. Splitting index file for {num_threads} workers...")
+
+    # 2. Calculate Byte Ranges
+    file_size = os.path.getsize(protein_index_file)
+    chunk_size = file_size // num_threads
+    
+    processes = []
+    temp_files = []
+
+    # 3. Spawn Workers
+    for i in range(num_threads):
+        start_byte = i * chunk_size
+        end_byte = file_size if i == num_threads - 1 else (i + 1) * chunk_size
+        
+        temp_out = f"{tmp_folder}/all_proteins.fasta.zst.part.{i}"
+        temp_files.append(temp_out)
+        
+        p = Process(target=_worker_process_obtain_all_proteins, args=(
+            i, protein_index_file, protein_file, temp_out,
+            start_byte, end_byte, file_size,
+            sorted_centroids_bytes, None
+        ))
+        processes.append(p)
+        p.start()
+
+    # 4. Wait for Completion
+    for p in processes:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f"Worker process {p.pid} failed with exit code {p.exitcode}")
+
+    print("Workers finished. Concatenating output files...")
+
+
+    # 5. Concatenate Temp Files (Binary Concatenation preserves Zstd frames)
+    with open(output_file, "wb") as out_f:
+        for temp_path in temp_files:
+            with open(temp_path, "rb") as in_f:
+                # shutil.copyfileobj is efficient
+                import shutil
+                shutil.copyfileobj(in_f, out_f)
+            os.remove(temp_path) # Cleanup
+
+    print("Finished fishing out the proteins from the zst file. Now decompressing...")
+
+    # 6. Decompress
+    # Note: Using python zstd module is safer than os.system, but keeping your pattern
+    os.system(f"zstd -d {output_file} -o {output_file}.tmp && mv {output_file}.tmp {output_file}")
+
+    time_elapsed = time.time() - time_start
+    print(f"Finished processing {len(centroids)} centroids in {time_elapsed:.2f} seconds. Output written to {output_file}.")
 
 def mmseqs2_results(original_query_fasta, returned_sequences_fasta, output_format, output_file, output_fasta_file, num_threads, intermediate_folder):
     """
@@ -1118,7 +1204,7 @@ if __name__ == "__main__":
     if len(plm_query_results) > 0:
         centroid_hits = list(set([x[1] for x in plm_query_results]))
         fasta_output = os.path.join(output_folder, "all_proteins.fasta")
-        obtain_all_proteins(centroid_hits, database+"/all_prots", path_to_centroid_to_prots, args.index_threads, fasta_output)
+        obtain_all_proteins(centroid_hits, database+"/all_prots", path_to_centroid_to_prots, args.index_threads, fasta_output, tmp_folder=intermediate_folder)
         #gzip the fasta file to save space
         time_now = time.time()
         with open(fasta_output, 'rb') as f_in:
@@ -1131,7 +1217,7 @@ if __name__ == "__main__":
         filtered_fasta_output = os.path.join(intermediate_folder, "all_proteins_filtered.fasta")
         filtered_query_results = _load_filtered_results_from_tsv(sorted_named_results_tsv, matched_centroids)
         centroids_fitered = list(set([x[1] for x in filtered_query_results]))
-        obtain_all_proteins(centroids_fitered, database+"/all_prots", path_to_centroid_to_prots, args.index_threads, filtered_fasta_output)
+        obtain_all_proteins(centroids_fitered, database+"/all_prots", path_to_centroid_to_prots, args.index_threads, filtered_fasta_output, tmp_folder=intermediate_folder)
         fasta_output = filtered_fasta_output
 
         # Run MMseqs2 and write main output files to output folder root
