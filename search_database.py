@@ -25,7 +25,7 @@ import bisect
 import multiprocessing
 from multiprocessing import Process
 
-__version__ = "3.1.1"
+__version__ = "3.2.0"
 
 WORKER_QUERY_EMBEDDINGS = None
 
@@ -930,14 +930,16 @@ def calculate_index_threads(database_folder, db_type, max_threads, max_memory_gb
     
     return index_threads
 
-def check_input_fasta(input_fasta):
+def check_input_fasta(input_fasta, many_queries=False):
     """
     Check if the input FASTA file exists, is readable, and is proteins (not nucleotides). Raises an error if any check fails.
     
     Args:
         input_fasta (str): Path to the input FASTA file.
+        many_queries (bool): If True, allow multiple queries in the FASTA file.
     """
 
+    number_of_sequences = 0
     with open(input_fasta, "r") as f:
         first_line = f.readline().strip()
         if not first_line.startswith(">"):
@@ -954,12 +956,24 @@ def check_input_fasta(input_fasta):
         if sequence_chars.issubset(nucleotide_chars):
             raise ValueError(f"Input FASTA file {input_fasta} appears to contain nucleotide sequences. Please provide protein sequences.")
 
+        # Count the number of sequences
+        number_of_sequences = 1
+        while True:
+            line = f.readline().strip()
+            if not line:
+                break
+            if line.startswith(">"):
+                number_of_sequences += 1
+
+        if not many_queries and number_of_sequences > 1:
+            raise ValueError(f"Input FASTA file {input_fasta} contains multiple sequences. Please provide a single query sequence.")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Search a database (FAISS or Usearch) using pre-computed embeddings. Can optionally embed query sequences on-the-fly.")
     parser.add_argument("--query_sequences", required=True, help="Fasta file of queries")
     parser.add_argument("--database", required=True, help="Path to the folder containing database files.")
     parser.add_argument("--output", "-o", required=True, help="Path to the output folder (created by embed_query.py if embedding step was run separately)")
-    parser.add_argument("--db-type", type=str, choices=['faiss', 'usearch'], default='usearch', help="Database type to use: faiss or usearch (default: usearch)")
+    parser.add_argument("--db-type", type=str, choices=['usearch','faiss'], default='usearch', help="Database type to use: faiss or usearch (default: usearch)")
     parser.add_argument("--outfmt", type=str, default='0', help="Format of the mmseqs2 output [0], default is 0 which is a tabular format with header. See mmseqs2 documentation for details.")
     parser.add_argument("-m", "--memory", type=float, required=True, help="Maximum memory available in GB (mandatory)")
     parser.add_argument("-t", "--num_threads", type=int, required=True, help="Maximum number of threads available (mandatory)")
@@ -967,6 +981,7 @@ if __name__ == "__main__":
     # parser.add_argument("-r","--do_not_reduce_query", action="store_true", help="Do not cluster similar proteins to reduce time (identity > 0.9)")
     #parser.add_argument("--subdatabases_size", type=int, default=10000000, help="Number of vectors in each faiss database")
     #parser.add_argument("--cutoff", type=float, default=0.2, help="Distance cutoff for results")
+    parser.add_argument("--many_queries", action="store_true", help="Use this flag to override the 1-protein-per-query limitation")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
@@ -982,7 +997,7 @@ if __name__ == "__main__":
     print("search_database.py version ", __version__)
     print("command line used:\n", " ".join(sys.argv))
 
-    check_input_fasta(args.query_sequences)
+    check_input_fasta(args.query_sequences, args.many_queries)
     
     # Set up folder structure
     output_folder = args.output.rstrip("/")
