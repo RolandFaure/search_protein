@@ -50,18 +50,15 @@ python search_database.py --help
                         Fasta file of queries
   --database DATABASE   Path to the folder containing database files.
   --output OUTPUT, -o OUTPUT
-                        Path to the output folder (created by embed_query.py if embedding step was run separately).
+                        Path to the output folder (created by embed_query.py if embedding step was run separately)
   --db-type {faiss,usearch}
-                        Database type of the database: faiss or usearch
-  --outfmt OUTFMT       Format of the mmseqs2 output [0], default is 0 which is a tabular format with header. See mmseqs2
-                        documentation for details.
+                        Database type to use: faiss or usearch (default: usearch)
+  --outfmt OUTFMT       Format of the mmseqs2 output [0], default is 0 which is a tabular format with header. See mmseqs2 documentation for details.
   -m MEMORY, --memory MEMORY
                         Maximum memory available in GB (mandatory)
   -t NUM_THREADS, --num_threads NUM_THREADS
                         Maximum number of threads available (mandatory)
   --force_cpu           Force the use of CPU even if GPUs are available (for embedding step).
-  --deep-search         If enabled, extract proteins from all search results instead of only aligned centroids, then align
-                        everything with MMseqs2
   --version             show program's version number and exit
 ```
 
@@ -71,7 +68,7 @@ results_folder/
 ├── PLM_aligned_proteins.tsv    # Set of proteins related to you queries according to the gLM2 protein language model (Logan50 proteins)
 ├── aligned_proteins.fasta  # Set of proteins aligning on your queries according to mmseqs2
 ├── aligned_proteins.mmseqs2  # Detail of the mmseqs2 alignments
-├── all_proteins.fasta  # *Only with deep_search* All the proteins in Logan corresponding to the PLM aligned proteins in Logan50
+├── all_proteins.fasta.gz  # All the proteins in Logan corresponding to the PLM aligned proteins in Logan50
 └── intermediate_files/
     ├── query_embeddings.npy
     ├── query_embeddings.names.txt
@@ -83,43 +80,25 @@ results_folder/
 
 ## Main Output Files
 
-- **`diversified_hits.tsv`**: TSV files containing Logan proteins which gLM2 embeddings have a cosine distance of less 0.2 to the embeddings fo the query.
+- **`PLM_aligned_proteins.tsv`**: TSV files containing Logan50 proteins which gLM2 embeddings have a cosine distance of less 0.2 to the embeddings fo the query.
 ```
 #query_name     result_name     result_sequences        cosine_distance
 alpha      ERR11474596_7103_1      MLDWNTSSDIFVEKLLQRNYKSQSLHSQPRHRPQVDGIPYEFGYKGTIYPMNKSRNCIIILLLIPVLVHSTRNAAYFESLEMKIVEQVKLNRAQGKWQLVRELLGLKGTFLKPRWQHFAKTVSSRDFFGNWLPLMLEIERYLYSKKMYPDSYLSWDDHSSYRVRKKVYRRGYDDKGSRRPEHKWFPENAFSRELLDEVPVKRAVYKPFELYHGYSEKRRRRSSLSSLLDL* 0.015888094902038574
 ```
-- **`matches.fasta`**: FASTA file containing all matched protein sequences
-- **`matches.mmseqs2`**: MMseqs2 alignment results of matched protein versus queries
+- **`all_proteins.fasta.gz`**: All Logan proteins found in the Logan50 clusters described in `PLM_aligned_proteins.tsv`.
+- **`aligned_proteins.mmseqs2`**: MMseqs2 alignment of proteins aligned against the query (many of the proteins in `all_proteins.fasta.gz` actually do not align to the query using mmseqs)
+- **`aligned_proteins.fasta`**: FASTA file containing proteins that align on the query
 ```
 #target  query  identity        alignment_length        nb_mismatches   nb_gap_openings target_start     target_end       query_start    query_end      evalue  bitscore
 SRR21885923_17279_1#87#695#-1   alpha   0.924   202     15      0       1       202     1       202     4.604E-129      393
 ```
 
-## Performance Tips
-
-To give an order of magnitude, searching for one protein takes 9000 CPU.s on my setup. Here are a few 
-key performance points to understand.
-
-1. **Batching queries**: The time needed to search through the database is strongly sub-linear in number of queries.
-On my system, the performance went from 2000 CPU.s for one query and 3000 CPU.s for 2000 queries on the nonhuman database.
-
-2. **Parallel Search**: Use multiple processes for faster database search. 
-Count ~200M of RAM per thread.
-
-3. **GPU Acceleration**: Use GPU for embedding 
-    At embedding time, using GPU takes ~0.1s / query versus 20s / query on CPU.
-    Keep in mind that embedding time is not significant for few queries.
-   ```bash
-   python embed_query.py --query_sequences queries.fasta --output results -F
-   # GPU will be used automatically if available, use --force_cpu if you do not want
-   ```
-
-
 ## Troubleshooting
 
 ### Out of memory
+The software automatically adjusts the number of threads used based on the memory available. This optimization is thought for *single-sequence queries*. This can typically lead to out-of-memory errors if querying several proteins.
 
-If you encounter out of memory errors during search, reduce the number of threads with `-t` (each process requires ~200MB of RAM, but this might depend on the query)
+In case of out-of-memory errors, decrease `-m` below the actual amount of available RAM, or decrease the number of available threads.
 
 ### Problem loading the model
 The script connects to the internet to load the gLM2 model the first time it runs. Make sure you have an internet connection.
