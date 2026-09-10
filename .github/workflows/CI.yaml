@@ -1,0 +1,63 @@
+name: Smoke test
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  smoke_test:
+    name: Smoke test for search_fasta
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Miniforge
+        uses: conda-incubator/setup-miniconda@v3.1.0
+        with:
+          miniforge-version: latest
+          activate-environment: search_fasta
+          auto-activate-base: false
+
+      - name: Cache conda environment
+        uses: actions/cache@v5
+        id: cache-conda
+        with:
+          path: ${{ env.CONDA }}/envs/search_fasta
+          key: conda-${{ runner.os }}-${{ hashFiles('**/README.md') }}
+
+      - name: Install conda dependencies
+        if: steps.cache-conda.outputs.cache-hit != 'true'
+        shell: bash -el {0}
+        run: |
+          mamba install -y \
+            -c pytorch -c nvidia -c conda-forge -c bioconda \
+            "nomkl" \
+            python=3.10 mmseqs2 "pytorch>=2.5" pytorch-cuda=12.1 \
+            "faiss-cpu>=1.8" numpy scikit-learn transformers einops
+
+      - name: Install pip dependencies
+        if: steps.cache-conda.outputs.cache-hit != 'true'
+        shell: bash -el {0}
+        run: pip install usearch
+
+      - name: Install system build dependencies
+        run: sudo apt-get install -y libzstd-dev
+
+      - name: Patch missing cstdint include
+        run: sed -i $'/#include <sstream>/a\\\n#include <cstdint>' centroid_to_prots.cpp
+
+      - name: Compile C++ scripts
+        shell: bash -el {0}
+        run: make
+
+      - name: Smoke test - embed_query.py --help
+        shell: bash -el {0}
+        run: python embed_query.py --help
+
+      - name: Smoke test - search_database.py --help
+        shell: bash -el {0}
+        run: python search_database.py --help
