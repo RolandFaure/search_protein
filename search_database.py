@@ -25,7 +25,7 @@ import bisect
 import multiprocessing
 from multiprocessing import Process
 
-__version__ = "3.2.0"
+__version__ = "3.2.1"
 
 WORKER_QUERY_EMBEDDINGS = None
 
@@ -785,17 +785,20 @@ def mmseqs2_results(original_query_fasta, returned_sequences_fasta, output_forma
 
     with open(returned_sequences_fasta, "r") as target_f, open(output_fasta_file, "w") as out_f:
         name = None
+        header = None
         seq = []
         for line in target_f:
             line = line.strip()
             if line.startswith(">"):
                 if name is not None and name in aligned_ids:
-                    out_f.write(f"{name}\n{''.join(seq)}\n")
+                    out_f.write(f"{header}\n{''.join(seq)}\n")
                 seq = []
+                name = line.strip().split()[0][1:]  # Remove '>' and take the first part of the header
+                header = line.strip()
             else:
                 seq.append(line)
         if name is not None and name in aligned_ids:
-            out_f.write(f"{name}\n{''.join(seq)}\n")
+            out_f.write(f"{header}\n{''.join(seq)}\n")
 
 
 def align_centroids_with_mmseqs2(unique_fasta, query_fasta, num_threads, intermediate_folder=None):
